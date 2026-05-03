@@ -1,31 +1,54 @@
 # bmc
 
-Personal Rust monorepo for Kalshi prediction-market trading. Owner is a senior C++ developer; explanations and code reviews can assume systems-programming fluency.
+Personal polyglot monorepo for Kalshi prediction-market trading. Owner is a senior C++ developer; explanations and code reviews can assume systems-programming fluency.
 
 **Guiding principle: complexity is the primary failure mode.** Every new abstraction, generic, trait, layer, or config knob must earn its keep. Default to saying no — reversing a "no" is cheap, reversing a "yes" is expensive. When in doubt, write less and delete more.
 
 ## Layout
 
-Cargo workspace, flat layout. Strategy crates added incrementally as `crates/strategy-<name>` (binaries).
+Top-level split by language. Each language uses its native tooling without orchestration glue.
 
 ```
-crates/
-  kalshi-ws/            # async WebSocket client library
-  refdata-downloader/   # binary: pulls /series /events /markets via REST → NDJSON
-  strategy-*/           # trading strategies (planned)
+bmc/
+  rust/                              # Rust workspace
+    Cargo.toml                       # [workspace] members + shared deps
+    crates/
+      kalshi-ws/                     # async WebSocket client library
+      kalshi-refdata-download/       # binary: pulls /series /events /markets via REST → NDJSON
+      strategy-*/                    # trading strategies (planned)
+  scripts/                           # cross-cutting PowerShell wrappers
+    build-all.ps1                    # builds every package across all languages
+    kalshi-download-refdata.ps1      # snapshots into refdata/<YYYYMMDD>/kalshi/
+  refdata/                           # downloaded reference NDJSON, layout: <YYYYMMDD>/<source>/
+  CLAUDE.md, README.md
+  # python/, notebooks/, sql/ — added when needed, not before
 ```
 
-`[workspace.dependencies]` in the root `Cargo.toml` is the single source of truth for versions. Members use `dep = { workspace = true }` and may union extra features locally — they cannot remove workspace features.
+Inside `rust/`, `[workspace.dependencies]` in `Cargo.toml` is the single source of truth for versions. Members use `dep = { workspace = true }` and may union extra features locally — they cannot remove workspace features.
 
 ## Common commands
 
+Cargo commands run from inside `rust/` (cargo discovers the workspace from there).
+
 ```powershell
-cargo build                                          # whole workspace
+cd rust
+cargo build                                          # whole Rust workspace
 cargo test -p kalshi-ws
-cargo run -p refdata-downloader                      # → ./refdata/*.ndjson
+cargo run -p kalshi-refdata-download                 # raw run; default --out-dir is ./refdata
 cargo run -p kalshi-ws --example public_ticker
 cargo clippy --all-targets -- -D warnings
 ```
+
+From the repo root, top-level wrappers handle the multi-language story:
+
+```powershell
+.\scripts\build-all.ps1                              # cargo build --workspace --all-targets
+.\scripts\build-all.ps1 --release                    # extra args forwarded to cargo
+.\scripts\kalshi-download-refdata.ps1                # → refdata/<YYYYMMDD>/kalshi/
+.\scripts\kalshi-download-refdata.ps1 --env demo     # extra args forwarded to the binary
+```
+
+To run cargo from the repo root without `cd`, use `--manifest-path rust/Cargo.toml`.
 
 ## Kalshi specifics
 
@@ -76,7 +99,7 @@ Three tasks share an `Arc<Inner>` inside `Client`:
 
 `Subscription<T>: Stream<Item = T>` is the public surface; `Drop` issues a best-effort unsubscribe via `try_send`.
 
-Detailed design lives in `~/.claude/plans/resilient-orbiting-gadget.md`.
+Source under `rust/crates/kalshi-ws/`. Detailed design lives in `~/.claude/plans/resilient-orbiting-gadget.md`.
 
 ## Out of scope (don't add without asking)
 
