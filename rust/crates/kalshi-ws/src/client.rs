@@ -1,7 +1,7 @@
 //! High-level client: owns the connection, multiplexes server frames by
 //! subscription id, and supervises auto-reconnect with subscription replay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -220,7 +220,14 @@ pub(crate) struct Inner {
     config: Config,
     cmd_tx: mpsc::Sender<ClientCommand>,
     registry: Arc<Mutex<SubRegistry>>,
+    /// In-flight non-subscribe requests (Ok / Unsubscribed / Error responses
+    /// match by `id`). Subscribed acks live in `pending_subscribes` instead
+    /// because Kalshi's wire format omits `id` on those.
     inflight: Mutex<HashMap<u64, oneshot::Sender<ServerMessage>>>,
+    /// FIFO queue of pending subscribe requests. Each Subscribed ack pops the
+    /// front of this queue. Errors that arrive with the original `id` echoed
+    /// scan the queue and remove the matching entry.
+    pending_subscribes: Mutex<VecDeque<(u64, oneshot::Sender<ServerMessage>)>>,
     events_tx: broadcast::Sender<SystemEvent>,
     ids: Arc<IdGenerator>,
     cancel: CancellationToken,
@@ -266,6 +273,7 @@ impl Client {
             cmd_tx: cmd_tx.clone(),
             registry: Arc::new(Mutex::new(SubRegistry::default())),
             inflight: Mutex::new(HashMap::new()),
+            pending_subscribes: Mutex::new(VecDeque::new()),
             events_tx: events_tx.clone(),
             ids: Arc::new(IdGenerator::default()),
             cancel: CancellationToken::new(),
@@ -578,12 +586,38 @@ impl Client {
             saw_seq,
         };
 
-        // Stage the spec in the registry first so the supervisor sees it during a
-        // mid-flight reconnect, but we won't have a sid yet — register on ack.
-        let rx = self.register_inflight(req_id);
-        self.send_command(ClientCommand::Subscribe { id: req_id, params })
-            .await?;
-        let ack = await_ack(rx, self.inner.config.request_timeout).await?;
+        // Subscribe acks come without an `id` from Kalshi, so we use a FIFO
+        // queue rather than the id-keyed inflight map. Errors that DO carry an
+        // id back are delivered via the same oneshot — handle_text scans the
+        // queue by id when an Error matches a pending subscribe.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if let Ok(mut q) = self.inner.pending_subscribes.lock() {
+            q.push_back((req_id, ack_tx));
+        }
+        let send_result = self
+            .send_command(ClientCommand::Subscribe { id: req_id, params })
+            .await;
+        if let Err(e) = send_result {
+            // Roll the queue entry back if the send failed; otherwise it would
+            // leak and cause off-by-one matching for the next subscribe.
+            if let Ok(mut q) = self.inner.pending_subscribes.lock() {
+                if let Some(pos) = q.iter().position(|(rid, _)| *rid == req_id) {
+                    q.remove(pos);
+                }
+            }
+            return Err(e);
+        }
+        let ack_result = await_ack(ack_rx, self.inner.config.request_timeout).await;
+        // On any non-success outcome (timeout, channel closed, server error)
+        // ensure the queue entry is gone.
+        if ack_result.is_err() {
+            if let Ok(mut q) = self.inner.pending_subscribes.lock() {
+                if let Some(pos) = q.iter().position(|(rid, _)| *rid == req_id) {
+                    q.remove(pos);
+                }
+            }
+        }
+        let ack = ack_result?;
         let sid = match ack {
             ServerMessage::Subscribed { msg, .. } => msg.sid,
             other => {
@@ -731,12 +765,19 @@ async fn replay_subscriptions(inner: &Arc<Inner>) {
                 ..spec.params.clone()
             },
         };
+        // Replay registers in pending_subscribes (FIFO), same as fresh subscribes,
+        // because Subscribed acks lack an `id` to match by.
         let (tx, rx) = oneshot::channel();
-        if let Ok(mut map) = inner.inflight.lock() {
-            map.insert(req_id, tx);
+        if let Ok(mut q) = inner.pending_subscribes.lock() {
+            q.push_back((req_id, tx));
         }
         if inner.cmd_tx.send(cmd).await.is_err() {
             warn!("replay: writer dead before subscribe sent");
+            if let Ok(mut q) = inner.pending_subscribes.lock() {
+                if let Some(pos) = q.iter().position(|(rid, _)| *rid == req_id) {
+                    q.remove(pos);
+                }
+            }
             return;
         }
         match tokio::time::timeout(inner.config.request_timeout, rx).await {
@@ -756,7 +797,14 @@ async fn replay_subscriptions(inner: &Arc<Inner>) {
             }
             Ok(Ok(other)) => warn!("replay: unexpected ack: {other:?}"),
             Ok(Err(_)) => warn!("replay: ack channel closed"),
-            Err(_) => warn!("replay: ack timed out for {sub_id}"),
+            Err(_) => {
+                warn!("replay: ack timed out for {sub_id}");
+                if let Ok(mut q) = inner.pending_subscribes.lock() {
+                    if let Some(pos) = q.iter().position(|(rid, _)| *rid == req_id) {
+                        q.remove(pos);
+                    }
+                }
+            }
         }
     }
 }
@@ -803,11 +851,66 @@ fn handle_text(inner: &Arc<Inner>, text: &str) {
     };
 
     if parsed.is_control() {
+        // Subscribed acks live in pending_subscribes regardless of whether the
+        // server echoes `id`. If `id` is present, scan the queue and remove
+        // that specific entry; otherwise FIFO pop the oldest (Kalshi's actual
+        // production behavior).
+        if matches!(&parsed, ServerMessage::Subscribed { .. }) {
+            let echoed_id = parsed.request_id();
+            let popped = if let Some(rid) = echoed_id {
+                inner.pending_subscribes.lock().ok().and_then(|mut q| {
+                    q.iter()
+                        .position(|(qid, _)| *qid == rid)
+                        .and_then(|pos| q.remove(pos))
+                })
+            } else {
+                inner
+                    .pending_subscribes
+                    .lock()
+                    .ok()
+                    .and_then(|mut q| q.pop_front())
+            };
+            match popped {
+                Some((_req_id, tx)) => {
+                    let _ = tx.send(parsed);
+                }
+                None => warn!("subscribed ack arrived with no pending request"),
+            }
+            return;
+        }
+
+        // Error frames may be a response to a failed subscribe (id echoed back),
+        // a failed update_subscription, etc. Try the inflight map first, then
+        // fall back to scanning pending_subscribes by id.
+        if let ServerMessage::Error { id: Some(id), .. } = &parsed {
+            let id = *id;
+            // Inflight first.
+            let inflight_hit = inner
+                .inflight
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&id));
+            if let Some(tx) = inflight_hit {
+                let _ = tx.send(parsed);
+                return;
+            }
+            // Then pending_subscribes.
+            let queued = inner.pending_subscribes.lock().ok().and_then(|mut q| {
+                q.iter()
+                    .position(|(rid, _)| *rid == id)
+                    .and_then(|pos| q.remove(pos))
+            });
+            if let Some((_, tx)) = queued {
+                let _ = tx.send(parsed);
+                return;
+            }
+        }
+
+        // Ok / Unsubscribed / Error without id: id-keyed inflight only.
         if let Some(req_id) = parsed.request_id() {
             inner.complete_inflight(req_id, parsed);
             return;
         }
-        // Error frames without a matching request id — log and emit nothing.
         if let ServerMessage::Error { msg, .. } = &parsed {
             warn!(code = msg.code, "server error: {}", msg.msg);
         }

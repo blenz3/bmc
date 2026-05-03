@@ -10,6 +10,16 @@
     The per-source subdirectory (kalshi/) leaves room for additional venues
     (polymarket/, manifold/, ...) under the same dated snapshot folder.
 
+    By default, /events and /markets are filtered to status=open — settled
+    history is huge and not needed for most operational use cases. /series is
+    a catalog of recurring templates; Kalshi's API doesn't accept a status
+    filter on it, so we always fetch the full series list (it's small — one
+    page of ~10k records).
+
+    To include everything, run the binary directly with --markets-status all
+    --events-status all (the script's hardcoded filters would conflict with
+    duplicate flags through ExtraArgs).
+
     Any extra arguments are forwarded to the binary, so you can do:
         .\scripts\kalshi-download-refdata.ps1 --env demo --request-delay-ms 500
 
@@ -41,7 +51,12 @@ Push-Location $rustDir
 try {
     $cargoArgs = @("run")
     if ($profileFlag) { $cargoArgs += $profileFlag }
-    $cargoArgs += @("-p", "kalshi-refdata-download", "--", "--out-dir", $outDir)
+    $cargoArgs += @(
+        "-p", "kalshi-refdata-download", "--",
+        "--out-dir", $outDir,
+        "--markets-status", "open",
+        "--events-status", "open"
+    )
     if ($ExtraArgs) { $cargoArgs += $ExtraArgs }
     & cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) {

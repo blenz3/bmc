@@ -17,6 +17,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Internal crates — strategies depend on these via path.
 kalshi-ws = { path = "crates/kalshi-ws" }
+kalshi-rest = { path = "crates/kalshi-rest" }
 
 # Async runtime + WebSocket
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
@@ -43,6 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 
-# REST client + CLI (for the refdata-downloader binary)
+# REST client + CLI
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }

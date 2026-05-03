@@ -1,0 +1,34 @@
+[package]
+name = "kalshi-rest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async Rust client for the Kalshi REST trading API: orders, positions, balance, fills"
+
+[lib]
+name = "kalshi_rest"
+path = "src/lib.rs"
+
+[dependencies]
+# Reuses Credentials::signed_headers and the shared Side enum.
+kalshi-ws = { workspace = true }
+
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+uuid = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+serde_json = { workspace = true }
+# In-test key generation for paper-mode tests; kalshi-ws's signing infra reuses these.
+rsa = { workspace = true }
+rand = { workspace = true }

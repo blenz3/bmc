@@ -112,6 +112,115 @@ fn parses_orderbook_snapshot_and_delta() {
     }));
 }
 
+/// Regression: production wire ships scalar `_dollars` and `_fp` fields as
+/// strings. Every numeric field across every payload type must accept either
+/// form.
+#[test]
+fn parses_orderbook_delta_with_string_scalars() {
+    use kalshi_ws::ServerMessage;
+    let v = json!({
+        "type": "orderbook_delta",
+        "sid": 1,
+        "seq": 220,
+        "msg": {
+            "market_ticker": "KXBTC15M-26MAY031645-45",
+            "market_id": "uuid",
+            "price_dollars": "0.5500",
+            "delta_fp": "2.00",
+            "side": "yes",
+            "ts_ms": 1777840360467i64
+        }
+    });
+    let parsed: ServerMessage = serde_json::from_value(v).expect("parse");
+    if let ServerMessage::OrderbookDelta { msg, .. } = parsed {
+        assert!((msg.price_dollars - 0.55).abs() < 1e-9);
+        assert_eq!(msg.delta_fp, 2);
+    } else {
+        panic!("expected OrderbookDelta");
+    }
+}
+
+#[test]
+fn parses_ticker_with_string_numerics() {
+    use kalshi_ws::ServerMessage;
+    let v = json!({
+        "type": "ticker",
+        "sid": 1,
+        "msg": {
+            "market_ticker": "KX-FOO",
+            "price_dollars": "0.5500",
+            "yes_bid_dollars": "0.5400",
+            "yes_ask_dollars": "0.5600",
+            "volume_fp": "12345",
+            "open_interest_fp": "6789",
+            "dollar_volume": "1000",
+            "dollar_open_interest": "2000",
+            "yes_bid_size_fp": "100",
+            "yes_ask_size_fp": "200",
+            "last_trade_size_fp": "50",
+            "ts_ms": "1714512345678"
+        }
+    });
+    let parsed: ServerMessage = serde_json::from_value(v).expect("parse string-form ticker");
+    if let ServerMessage::Ticker { msg, .. } = parsed {
+        assert!((msg.price_dollars - 0.55).abs() < 1e-9);
+        assert_eq!(msg.volume_fp, 12345);
+    } else {
+        panic!("expected Ticker");
+    }
+}
+
+/// Regression: production wire ships price levels as `[string, string]` rather
+/// than `[number, number]`. The custom deserializer must accept both.
+#[test]
+fn parses_orderbook_snapshot_with_string_levels() {
+    use kalshi_ws::ServerMessage;
+    let v = json!({
+        "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+        "msg": {
+            "market_ticker": "KXBTC-26MAY0317-T87749.99",
+            "market_id": "uuid-here",
+            "no_dollars_fp": [
+                ["0.0100", "33413.00"],
+                ["0.9900", "16303.00"]
+            ],
+            "yes_dollars_fp": [
+                ["0.5000", "666.00"],
+                ["0.6500", "120.00"]
+            ]
+        }
+    });
+    let parsed: ServerMessage = serde_json::from_value(v).expect("parse");
+    if let ServerMessage::OrderbookSnapshot { msg, .. } = parsed {
+        assert_eq!(msg.no_dollars_fp.len(), 2);
+        assert!((msg.no_dollars_fp[0].0 - 0.01).abs() < 1e-9);
+        assert_eq!(msg.no_dollars_fp[0].1, 33413);
+        assert_eq!(msg.no_dollars_fp[1].1, 16303);
+        assert_eq!(msg.yes_dollars_fp[1].1, 120);
+    } else {
+        panic!("expected OrderbookSnapshot");
+    }
+}
+
+/// Regression: production wire omits `id` on Subscribed acks. Type must accept it.
+#[test]
+fn parses_subscribed_without_id() {
+    use kalshi_ws::ServerMessage;
+    let v = json!({
+        "type": "subscribed",
+        "msg": { "channel": "orderbook_delta", "sid": 1 }
+    });
+    let parsed: ServerMessage = serde_json::from_value(v).expect("parse");
+    match parsed {
+        ServerMessage::Subscribed { id, msg } => {
+            assert_eq!(id, None);
+            assert_eq!(msg.channel, "orderbook_delta");
+            assert_eq!(msg.sid, 1);
+        }
+        other => panic!("expected Subscribed, got {other:?}"),
+    }
+}
+
 #[test]
 fn parses_fill() {
     assert_parses(json!({

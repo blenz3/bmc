@@ -4,6 +4,9 @@
 //! - subscribe → server ack with assigned `sid`
 //! - typed `Subscription<Ticker>` receives a server-pushed frame
 //! - `Subscription::Drop` issues an `unsubscribe` command
+//! - Subscribed acks WITHOUT echoed `id` (Kalshi's real wire shape) are matched
+//!   to the pending subscribe via FIFO.
+//! - String-encoded price levels (`["0.0100","33413.00"]`) deserialize correctly.
 
 use std::time::Duration;
 
@@ -13,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use kalshi_ws::{Client, Environment};
+use kalshi_ws::{Client, Environment, OrderbookEvent};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_receives_typed_frames_and_unsubscribes_on_drop() {
@@ -99,6 +102,90 @@ async fn subscribe_receives_typed_frames_and_unsubscribes_on_drop() {
         assert!((frame.price_dollars - 0.5).abs() < 1e-9);
     }
     // Subscription dropped here → client should send unsubscribe.
+
+    server.await.expect("server task completes");
+    client.shutdown();
+}
+
+/// Regression: Kalshi production sends `subscribed` acks WITHOUT echoing `id`.
+/// The client must still resolve the subscribe via the FIFO pending-subscribes
+/// queue, and the orderbook snapshot must accept string-encoded price levels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribed_without_id_and_string_encoded_levels() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+
+        // Read subscribe command (we don't care about the req_id since we
+        // deliberately won't echo it).
+        let frame = ws.next().await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        assert_eq!(v["cmd"], "subscribe");
+        assert_eq!(v["params"]["channels"][0], "orderbook_delta");
+
+        // Send Subscribed ack with NO `id` field — matches Kalshi production wire.
+        let ack = json!({
+            "type": "subscribed",
+            "msg": { "channel": "orderbook_delta", "sid": 7 }
+        });
+        ws.send(Message::Text(ack.to_string().into())).await.unwrap();
+
+        // Push an orderbook snapshot with string-encoded fixed-point levels.
+        let snap = json!({
+            "type": "orderbook_snapshot",
+            "sid": 7,
+            "seq": 1,
+            "msg": {
+                "market_ticker": "KX-FAKE",
+                "yes_dollars_fp": [["0.6500", "120.00"], ["0.6400", "180.00"]],
+                "no_dollars_fp":  [["0.3400", "200.00"], ["0.3300", "150.00"]]
+            }
+        });
+        ws.send(Message::Text(snap.to_string().into())).await.unwrap();
+
+        // Wait briefly so the client can drain the snapshot before we close.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = ws.close(None).await;
+    });
+
+    let client = Client::builder()
+        .environment(Environment::Custom {
+            url: format!("ws://127.0.0.1:{port}/test"),
+            path: "/test".into(),
+        })
+        .reconnect(kalshi_ws::ReconnectPolicy {
+            // Disable reconnect so the test doesn't loop after the server closes.
+            enabled: false,
+            ..Default::default()
+        })
+        .connect()
+        .await
+        .expect("client connects");
+
+    let mut sub = client
+        .subscribe_orderbook(vec!["KX-FAKE".into()])
+        .await
+        .expect("subscribe completes despite missing id");
+
+    let evt = tokio::time::timeout(Duration::from_secs(3), sub.next())
+        .await
+        .expect("snapshot arrives")
+        .expect("stream not closed");
+
+    match evt {
+        OrderbookEvent::Snapshot { snapshot, .. } => {
+            assert_eq!(snapshot.market_ticker, "KX-FAKE");
+            // String-encoded levels parsed correctly.
+            assert_eq!(snapshot.yes_dollars_fp.len(), 2);
+            assert!((snapshot.yes_dollars_fp[0].0 - 0.65).abs() < 1e-9);
+            assert_eq!(snapshot.yes_dollars_fp[0].1, 120);
+            assert_eq!(snapshot.no_dollars_fp[0].1, 200);
+        }
+        other => panic!("expected Snapshot first, got {other:?}"),
+    }
 
     server.await.expect("server task completes");
     client.shutdown();

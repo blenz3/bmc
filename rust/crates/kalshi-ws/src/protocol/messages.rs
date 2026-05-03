@@ -9,12 +9,86 @@ use serde::{Deserialize, Serialize};
 
 use super::channels::Side;
 
+/// Tolerant numeric deserializers. Kalshi's production wire serializes most
+/// `_dollars` and `_fp` fields as JSON strings (`"0.5500"`, `"33413.00"`),
+/// but the docs and some endpoints still ship plain numbers. These helpers
+/// accept either form.
+///
+/// Apply with `#[serde(deserialize_with = "num_serde::as_f64")]` etc. on the
+/// field. Serialization continues to use serde's default (writes a number).
+mod num_serde {
+    use serde::{de::Error as DeError, Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(super) enum NumOrStr {
+        Num(f64),
+        Str(String),
+    }
+
+    pub(super) fn to_f64<E: DeError>(v: NumOrStr) -> Result<f64, E> {
+        match v {
+            NumOrStr::Num(n) => Ok(n),
+            NumOrStr::Str(s) => s.parse::<f64>().map_err(E::custom),
+        }
+    }
+
+    pub(super) fn to_i64<E: DeError>(v: NumOrStr) -> Result<i64, E> {
+        match v {
+            NumOrStr::Num(n) => Ok(n as i64),
+            // Accept "33413.00" or similar by parsing as f64 then truncating.
+            NumOrStr::Str(s) => s
+                .parse::<f64>()
+                .map(|f| f as i64)
+                .map_err(E::custom),
+        }
+    }
+
+    pub fn as_f64<'de, D>(d: D) -> Result<f64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        to_f64::<D::Error>(NumOrStr::deserialize(d)?)
+    }
+
+    pub fn as_f64_opt<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<NumOrStr>::deserialize(d)?
+            .map(to_f64::<D::Error>)
+            .transpose()
+    }
+
+    pub fn as_i64<'de, D>(d: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        to_i64::<D::Error>(NumOrStr::deserialize(d)?)
+    }
+
+    pub fn as_i64_opt<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<NumOrStr>::deserialize(d)?
+            .map(to_i64::<D::Error>)
+            .transpose()
+    }
+}
+
 /// All possible server frames, internally tagged on the `type` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Acknowledges a `subscribe` command and assigns a `sid`.
-    Subscribed { id: u64, msg: SubscribedAck },
+    /// Acknowledges a `subscribe` command and assigns a `sid`. Kalshi's
+    /// production WS does not echo the request `id` here, so it's modeled as
+    /// optional; matching falls back to FIFO over pending subscribe requests.
+    Subscribed {
+        #[serde(default)]
+        id: Option<u64>,
+        msg: SubscribedAck,
+    },
 
     /// Generic success ack for `update_subscription`, etc.
     Ok {
@@ -113,12 +187,13 @@ impl ServerMessage {
         )
     }
 
-    /// Request id for control frames that carry one.
+    /// Request id for control frames that carry one. `Subscribed` and `Error`
+    /// may legitimately have no id on the wire — matching falls back to
+    /// FIFO/sid-based lookup elsewhere in the client.
     pub fn request_id(&self) -> Option<u64> {
         match self {
-            ServerMessage::Subscribed { id, .. }
-            | ServerMessage::Ok { id, .. }
-            | ServerMessage::Unsubscribed { id, .. } => Some(*id),
+            ServerMessage::Ok { id, .. } | ServerMessage::Unsubscribed { id, .. } => Some(*id),
+            ServerMessage::Subscribed { id, .. } => *id,
             ServerMessage::Error { id, .. } => *id,
             _ => None,
         }
@@ -161,16 +236,27 @@ pub struct Ticker {
     pub market_ticker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_id: Option<String>,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_bid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_ask_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub volume_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub open_interest_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub dollar_volume: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub dollar_open_interest: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub yes_bid_size_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub yes_ask_size_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub last_trade_size_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub ts_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<String>,
@@ -180,26 +266,59 @@ pub struct Ticker {
 pub struct Trade {
     pub trade_id: String,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub no_price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub count_fp: i64,
     pub taker_side: Side,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub ts_ms: i64,
 }
 
 /// One price level: `[price_dollars, count_fp]`.
 pub type PriceLevel = (f64, i64);
 
+/// Tolerant deserialization for `[price, size]` price-level arrays. Reuses
+/// the [`num_serde`] number-or-string parsers for each tuple element.
+mod price_levels_serde {
+    use super::num_serde::{to_f64, to_i64, NumOrStr};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Vec<(f64, i64)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw: Vec<(NumOrStr, NumOrStr)> = Vec::deserialize(d)?;
+        raw.into_iter()
+            .map(|(p, s)| {
+                let price = to_f64::<D::Error>(p)?;
+                let size = to_i64::<D::Error>(s)?;
+                Ok((price, size))
+            })
+            .collect()
+    }
+
+    #[allow(clippy::ptr_arg)]
+    pub fn serialize<S>(levels: &Vec<(f64, i64)>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        levels.serialize(s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderbookSnapshot {
     pub market_ticker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "price_levels_serde")]
     pub yes_dollars_fp: Vec<PriceLevel>,
-    #[serde(default)]
+    #[serde(default, with = "price_levels_serde")]
     pub no_dollars_fp: Vec<PriceLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub ts_ms: Option<i64>,
 }
 
@@ -208,14 +327,16 @@ pub struct OrderbookDelta {
     pub market_ticker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_id: Option<String>,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub delta_fp: i64,
     pub side: Side,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subaccount: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub ts_ms: Option<i64>,
 }
 
@@ -235,11 +356,16 @@ pub struct Fill {
     pub market_ticker: String,
     pub is_taker: bool,
     pub side: Side,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub count_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub fee_cost: f64,
     pub action: FillAction,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub ts_ms: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub post_position_fp: i64,
     pub purchased_side: Side,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,24 +389,33 @@ pub struct UserOrder {
     pub status: UserOrderStatus,
     pub side: Side,
     pub is_yes: bool,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_price_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub fill_count_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub remaining_count_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub initial_count_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub taker_fill_cost_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub maker_fill_cost_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub taker_fees_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub maker_fees_dollars: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub created_ts_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_trade_prevention_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub last_updated_ts_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub expiration_ts_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subaccount_number: Option<String>,
@@ -298,11 +433,17 @@ pub enum UserOrderStatus {
 pub struct MarketPosition {
     pub user_id: String,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub position_fp: i64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub position_cost_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub realized_pnl_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub fees_paid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub position_fee_cost_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub volume_fp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subaccount: Option<String>,
@@ -314,17 +455,17 @@ pub struct MarketPosition {
 pub struct MarketLifecycleEvent {
     pub event_type: MarketLifecycleEventType,
     pub market_ticker: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub open_ts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub close_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub determination_ts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_f64_opt")]
     pub settlement_value: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub settled_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_deactivated: Option<bool>,
@@ -376,7 +517,7 @@ pub struct SelectedMarket {
 pub struct OrderGroupUpdate {
     pub event_type: OrderGroupUpdateType,
     pub order_group_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub contracts_limit_fp: Option<i64>,
 }
 
@@ -399,12 +540,13 @@ pub struct RfqCreated {
     pub market_ticker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ticker: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub contracts_count_fp: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_f64_opt")]
     pub yes_bid_dollars: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_f64_opt")]
     pub no_bid_dollars: Option<f64>,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub created_ts: i64,
 }
 
@@ -413,7 +555,9 @@ pub struct RfqDeleted {
     pub id: String,
     pub creator_id: String,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub created_ts: i64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub deleted_ts: i64,
 }
 
@@ -423,8 +567,11 @@ pub struct QuoteCreated {
     pub rfq_id: String,
     pub quote_creator_id: String,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_bid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub no_bid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub created_ts: i64,
 }
 
@@ -434,12 +581,15 @@ pub struct QuoteAccepted {
     pub rfq_id: String,
     pub quote_creator_id: String,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub yes_bid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_f64")]
     pub no_bid_dollars: f64,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub created_ts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_side: Option<Side>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "num_serde::as_i64_opt")]
     pub contracts_accepted_fp: Option<i64>,
 }
 
@@ -453,6 +603,7 @@ pub struct QuoteExecuted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
     pub market_ticker: String,
+    #[serde(deserialize_with = "num_serde::as_i64")]
     pub executed_ts: i64,
 }
 

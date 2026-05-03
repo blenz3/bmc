@@ -1,0 +1,26 @@
+[package]
+name = "kalshi-book-watch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Watches a Kalshi market's L2 order book live in the terminal"
+
+[[bin]]
+name = "kalshi-book-watch"
+path = "src/main.rs"
+
+[dependencies]
+kalshi-ws = { workspace = true }
+
+tokio = { workspace = true, features = ["signal"] }
+reqwest = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -13,12 +13,15 @@ bmc/
   rust/                              # Rust workspace
     Cargo.toml                       # [workspace] members + shared deps
     crates/
-      kalshi-ws/                     # async WebSocket client library
+      kalshi-ws/                     # async WebSocket client library (market data, fills feed)
+      kalshi-rest/                   # async REST client (orders, positions, balance, fills history)
       kalshi-refdata-download/       # binary: pulls /series /events /markets via REST → NDJSON
+      kalshi-book-watch/             # binary: live L2 orderbook for the latest market in a series
       strategy-*/                    # trading strategies (planned)
   scripts/                           # cross-cutting PowerShell wrappers
     build-all.ps1                    # builds every package across all languages
     kalshi-download-refdata.ps1      # snapshots into refdata/<YYYYMMDD>/kalshi/
+    kalshi-watch-btc.ps1             # live L2 orderbook for the latest BTC 15-min contract
   refdata/                           # downloaded reference NDJSON, layout: <YYYYMMDD>/<source>/
   CLAUDE.md, README.md
   # python/, notebooks/, sql/ — added when needed, not before
@@ -58,6 +61,9 @@ To run cargo from the repo root without `cd`, use `--manifest-path rust/Cargo.to
 - **Auth**: RSA-PSS-SHA256 over `timestamp_ms || METHOD || path` (no query string), base64-standard encoded. Headers `kalshi-access-key`, `kalshi-access-signature`, `kalshi-access-timestamp`. Reuse `kalshi_ws::Credentials::signed_headers(method, path)` — don't reimplement.
 - **Header names must be lowercase** — uppercase `&'static str` literals panic in `HeaderName::from_static`.
 - **Reference endpoints don't require auth** (`/series`, `/events`, `/markets`, `/exchange/status`). Auth still works if creds are supplied; may give higher rate limits.
+- **Orders go via REST, not WebSocket.** `kalshi-rest` covers `POST /portfolio/orders`, cancel, decrease, get, list, plus `/portfolio/{positions,balance,fills}`. The WS feed is read-only — `fill` and `user_orders` channels are post-trade reporting, not order entry.
+- **Idempotency for orders**: `kalshi_rest::Client::place_order` always sends a `client_order_id` (auto-generates a UUID v4 if the caller doesn't). Kalshi dedupes on this field, so retries after a network blip are safe.
+- **`Mode::Paper`** on `kalshi-rest` hard-refuses `place_order` / `cancel_order` / `decrease_order` before any HTTP — useful for tests and dry-runs. `Mode::Live` is the default; flip to Paper explicitly when scaffolding strategies.
 - **REST rate limits**: ~5 RPS per endpoint in practice. The downloader paces at 250ms default and retries 429/5xx with exponential backoff (`Retry-After` honored when present). Don't lower the delay without a reason.
 - **REST pagination**: cursor at top level of response; empty/missing `cursor` ⇒ done. `/events` enforces `limit=200`; `/series` returned 9899 records in one page (limit ignored).
 - **Numeric fields**: `_dollars` → `f64`, `_fp` (fixed-point) → `i64`, `_ts_ms` → `i64`.

@@ -37,6 +37,34 @@ impl EnvArg {
     }
 }
 
+/// Filter values accepted by `/markets?status=` and `/events?status=`. Same enum
+/// works for both endpoints. `All` is a sentinel meaning "do not send the
+/// status query param" — giving the unfiltered (and much larger) set including
+/// settled history.
+///
+/// `/series` does NOT accept this filter; series is a catalog of recurring
+/// templates rather than a lifecycle-bearing entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LifecycleStatus {
+    Unopened,
+    Open,
+    Closed,
+    Settled,
+    All,
+}
+
+impl LifecycleStatus {
+    fn as_query_value(self) -> Option<&'static str> {
+        match self {
+            LifecycleStatus::Unopened => Some("unopened"),
+            LifecycleStatus::Open => Some("open"),
+            LifecycleStatus::Closed => Some("closed"),
+            LifecycleStatus::Settled => Some("settled"),
+            LifecycleStatus::All => None,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "kalshi-refdata-download", about, version)]
 struct Cli {
@@ -52,10 +80,11 @@ struct Cli {
     #[arg(long)]
     base_url: Option<String>,
 
-    /// Page size. Kalshi caps at 200 for /events and 1000 for /markets in practice;
-    /// 200 is a safe default that works everywhere.
-    #[arg(long, default_value_t = 200)]
-    limit: u32,
+    /// Override page size for every endpoint. When unset, each endpoint uses its
+    /// own default: /markets and /series request 1000, /events requests 200
+    /// (Kalshi's cap there). Setting this forces all three to the same value.
+    #[arg(long)]
+    limit: Option<u32>,
 
     /// Minimum gap between successive requests, in milliseconds. Kalshi rate-limits
     /// per-endpoint; ~250ms (4 rps) is conservative and still completes /markets in
@@ -66,6 +95,17 @@ struct Cli {
     /// How many times to retry a single page on 429 / 5xx before giving up.
     #[arg(long, default_value_t = 6)]
     max_retries: u32,
+
+    /// Filter `/markets` by status. Defaults to no filter — pass `open` (the
+    /// most common operational case) to skip the much larger settled history.
+    #[arg(long, value_enum, default_value_t = LifecycleStatus::All)]
+    markets_status: LifecycleStatus,
+
+    /// Filter `/events` by status. Same vocabulary as `--markets-status`.
+    /// Defaults to no filter; the script wrapper sets this to `open`.
+    /// `/series` has no equivalent filter and is always fetched in full.
+    #[arg(long, value_enum, default_value_t = LifecycleStatus::All)]
+    events_status: LifecycleStatus,
 
     /// API key id. Falls back to `KALSHI_KEY_ID` env var.
     #[arg(long, env = "KALSHI_KEY_ID")]
@@ -119,59 +159,87 @@ async fn main() -> Result<()> {
         max_retries: cli.max_retries,
     };
 
-    // Sequential to keep request load gentle.
-    let total_series = paginate(
-        &http,
-        &base_url,
-        "/trade-api/v2/series",
-        "series",
-        creds.as_ref(),
-        cli.limit,
-        rl,
-        &cli.out_dir.join("series.ndjson"),
-    )
-    .await
-    .context("downloading /series")?;
+    // Per-endpoint page-size defaults. /events caps at 200; /markets and /series
+    // accept up to 1000 and finish far faster at the larger size.
+    let series_limit = cli.limit.unwrap_or(1000);
+    let events_limit = cli.limit.unwrap_or(200);
+    let markets_limit = cli.limit.unwrap_or(1000);
 
-    let total_events = paginate(
-        &http,
-        &base_url,
-        "/trade-api/v2/events",
-        "events",
-        creds.as_ref(),
-        cli.limit,
-        rl,
-        &cli.out_dir.join("events.ndjson"),
-    )
-    .await
-    .context("downloading /events")?;
+    // Run all four endpoints concurrently. They paginate independently, each
+    // pacing itself; if Kalshi 429s any one stream, that stream's retry layer
+    // backs off without stalling the others.
+    let creds_ref = creds.as_ref();
+    let series_path = cli.out_dir.join("series.ndjson");
+    let events_path = cli.out_dir.join("events.ndjson");
+    let markets_path = cli.out_dir.join("markets.ndjson");
+    let status_path = cli.out_dir.join("exchange_status.json");
 
-    let total_markets = paginate(
-        &http,
-        &base_url,
-        "/trade-api/v2/markets",
-        "markets",
-        creds.as_ref(),
-        cli.limit,
-        rl,
-        &cli.out_dir.join("markets.ndjson"),
-    )
-    .await
-    .context("downloading /markets")?;
+    // Build the per-endpoint extra-query filters once. Helper folds `LifecycleStatus`
+    // into a query slice and logs the resulting filter for visibility.
+    fn status_filter(label: &str, s: LifecycleStatus) -> Vec<(&'static str, &'static str)> {
+        match s.as_query_value() {
+            Some(v) => {
+                info!("{} filter: status={}", label, v);
+                vec![("status", v)]
+            }
+            None => {
+                info!("{} filter: none (full history)", label);
+                vec![]
+            }
+        }
+    }
+    let markets_extra = status_filter("/markets", cli.markets_status);
+    let events_extra = status_filter("/events", cli.events_status);
+    info!("/series filter: not supported by Kalshi; fetching full catalog");
 
-    fetch_one(
-        &http,
-        &base_url,
-        "/trade-api/v2/exchange/status",
-        creds.as_ref(),
-        rl,
-        &cli.out_dir.join("exchange_status.json"),
-    )
-    .await
-    .context("downloading /exchange/status")?;
+    let started = std::time::Instant::now();
+    let (total_series, total_events, total_markets, _) = tokio::try_join!(
+        paginate(
+            &http,
+            &base_url,
+            "/trade-api/v2/series",
+            "series",
+            creds_ref,
+            series_limit,
+            &[],
+            rl,
+            &series_path,
+        ),
+        paginate(
+            &http,
+            &base_url,
+            "/trade-api/v2/events",
+            "events",
+            creds_ref,
+            events_limit,
+            &events_extra,
+            rl,
+            &events_path,
+        ),
+        paginate(
+            &http,
+            &base_url,
+            "/trade-api/v2/markets",
+            "markets",
+            creds_ref,
+            markets_limit,
+            &markets_extra,
+            rl,
+            &markets_path,
+        ),
+        fetch_one(
+            &http,
+            &base_url,
+            "/trade-api/v2/exchange/status",
+            creds_ref,
+            rl,
+            &status_path,
+        ),
+    )?;
 
     info!(
-        "done. series={} events={} markets={} out_dir={}",
+        "done in {:.1}s. series={} events={} markets={} out_dir={}",
+        started.elapsed().as_secs_f64(),
         total_series,
         total_events,
         total_markets,
@@ -196,6 +264,9 @@ fn load_credentials(cli: &Cli) -> Result<Option<Credentials>> {
 }
 
 /// Walks one paginated list endpoint to completion, writing each item as a line of NDJSON.
+///
+/// `extra_query` lets a caller attach endpoint-specific filters (e.g. `status=open`
+/// for `/markets`) without adding more positional params for every future filter.
 async fn paginate(
     http: &reqwest::Client,
     base_url: &str,
@@ -203,6 +274,7 @@ async fn paginate(
     items_field: &str,
     creds: Option<&Credentials>,
     limit: u32,
+    extra_query: &[(&str, &str)],
     rl: RateLimit,
     out_path: &Path,
 ) -> Result<u64> {
@@ -216,8 +288,17 @@ async fn paginate(
     let mut page: u64 = 0;
 
     loop {
-        let resp = send_with_retry(http, base_url, path, cursor.as_deref(), Some(limit), creds, rl)
-            .await?;
+        let resp = send_with_retry(
+            http,
+            base_url,
+            path,
+            cursor.as_deref(),
+            Some(limit),
+            extra_query,
+            creds,
+            rl,
+        )
+        .await?;
         let body: Value = resp.json().await.context("parsing JSON page")?;
         let items = body
             .get(items_field)
@@ -267,7 +348,7 @@ async fn fetch_one(
     rl: RateLimit,
     out_path: &Path,
 ) -> Result<()> {
-    let resp = send_with_retry(http, base_url, path, None, None, creds, rl).await?;
+    let resp = send_with_retry(http, base_url, path, None, None, &[], creds, rl).await?;
     let bytes = resp.bytes().await?;
 
     let mut file = fs::File::create(out_path)
@@ -288,6 +369,7 @@ async fn send_with_retry(
     path: &str,
     cursor: Option<&str>,
     limit: Option<u32>,
+    extra_query: &[(&str, &str)],
     creds: Option<&Credentials>,
     rl: RateLimit,
 ) -> Result<Response> {
@@ -299,6 +381,9 @@ async fn send_with_retry(
         }
         if let Some(c) = cursor {
             req = req.query(&[("cursor", c)]);
+        }
+        if !extra_query.is_empty() {
+            req = req.query(extra_query);
         }
         if let Some(creds) = creds {
             // Re-sign every attempt — signatures embed a timestamp the server
