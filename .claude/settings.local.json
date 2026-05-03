@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:trading-api.readme.io)",
+      "WebSearch",
+      "WebFetch(domain:docs.kalshi.com)"
+    ]
+  }
+}
