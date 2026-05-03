@@ -329,27 +329,44 @@ impl Book {
         }
     }
 
+    /// YES-equivalent asks derived from NO bids (`ask_price = 100 - no_bid_price`),
+    /// in ascending price order (best/lowest first), capped to `depth`.
+    ///
+    /// Filters out asks that don't strictly exceed the best YES bid. Without
+    /// this filter, deep standing NO bids at e.g. $0.99 appear as YES asks at
+    /// $0.01 — visually below the YES bid book, which inverts the display.
+    /// Such entries represent crossed liquidity (the matching engine should
+    /// have already filled them, or they're protected by self-trade prevention,
+    /// or they're conditional / iceberg orders that don't auto-cross).
+    fn unified_asks(&self, depth: usize) -> Vec<(i64, i64)> {
+        let best_yes_bid = self.best_yes_bid().unwrap_or(0);
+        self.no
+            .iter()
+            .filter(|(&no_p, _)| (100 - no_p) > best_yes_bid)
+            // Keys ascending → after filter, .rev() iterates descending no_p,
+            // i.e., ascending YES ask price. Best (lowest) ask first.
+            .rev()
+            .take(depth)
+            .map(|(&no_p, &s)| (100 - no_p, s))
+            .collect()
+    }
+
     /// YES bids in descending price order (best/highest first), capped to `depth`.
-    fn unified_bids(&self, depth: usize) -> Vec<(i64, i64)> {
+    /// `best_ask_cap` filters out bids that would cross the displayed asks (any
+    /// such bid is an obviously stale / self-protected entry).
+    fn unified_bids(&self, depth: usize, best_ask_cap: Option<i64>) -> Vec<(i64, i64)> {
+        let upper = best_ask_cap.unwrap_or(101); // 101 > any valid price
         self.yes
             .iter()
+            .filter(|(&p, _)| p < upper)
             .rev()
             .take(depth)
             .map(|(&p, &s)| (p, s))
             .collect()
     }
 
-    /// YES-equivalent asks derived from NO bids (`ask_price = 100 - no_bid_price`),
-    /// in ascending price order (best/lowest first), capped to `depth`.
-    fn unified_asks(&self, depth: usize) -> Vec<(i64, i64)> {
-        // Highest NO bid maps to lowest YES ask. Iterate NO descending →
-        // transformed YES asks come out ascending.
-        self.no
-            .iter()
-            .rev()
-            .take(depth)
-            .map(|(&no_p, &s)| (100 - no_p, s))
-            .collect()
+    fn best_yes_bid(&self) -> Option<i64> {
+        self.yes.keys().next_back().copied()
     }
 }
 
@@ -400,14 +417,18 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
     println!("seq {:?}   updates received {}", book.last_seq, received);
     println!();
 
-    // Unified YES-centric book.
+    // Unified YES-centric book, filtered to non-crossing entries:
     //   asks (top of section, descending price → best ask just above the divider)
     //   ─── mid line ───
     //   bids (descending price → best bid just below the divider)
     //
-    // Asks are derived from NO bids: ask_price_cents = 100 - no_bid_price_cents.
-    let asks = book.unified_asks(depth); // ascending price (best first)
-    let bids = book.unified_bids(depth); // descending price (best first)
+    // Asks are derived from NO bids: ask_price_cents = 100 - no_bid_price_cents,
+    // restricted to those strictly above best_yes_bid. Bids are restricted to
+    // those strictly below the resulting best ask.
+    let asks = book.unified_asks(depth);
+    let best_ask = asks.first().map(|&(p, _)| p);
+    let bids = book.unified_bids(depth, best_ask);
+    let best_bid = bids.first().map(|&(p, _)| p);
 
     println!("{:>14} {:>12}", "price", "size");
     println!("{}", "-".repeat(28));
@@ -416,8 +437,6 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
         println!("{:>14} {:>12}    ASK", fmt_price(*price), size);
     }
 
-    let best_bid = book.yes.keys().next_back().copied();
-    let best_ask = book.no.keys().next_back().map(|n| 100 - n);
     match (best_bid, best_ask) {
         (Some(b), Some(a)) => {
             let mid = (b + a) as f64 / 2.0 / 100.0;
@@ -434,6 +453,32 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
 
     for (price, size) in bids.iter() {
         println!("{:>14} {:>12}    BID", fmt_price(*price), size);
+    }
+
+    // Surface that entries were hidden as crossed liquidity, so the user knows
+    // the displayed book isn't the entire raw orderbook.
+    let raw_no_top = book.no.keys().next_back().copied();
+    let raw_yes_top = book.yes.keys().next_back().copied();
+    if let (Some(yt), Some(nt)) = (raw_yes_top, raw_no_top) {
+        if yt + nt > 100 {
+            let crossed_size: i64 = book
+                .no
+                .iter()
+                .filter(|(&p, _)| (100 - p) <= yt)
+                .map(|(_, &s)| s)
+                .sum::<i64>()
+                + book
+                    .yes
+                    .iter()
+                    .filter(|(&p, _)| best_ask.map_or(false, |a| p >= a))
+                    .map(|(_, &s)| s)
+                    .sum::<i64>();
+            println!(
+                "(crossed: yes_bid_top + no_bid_top = ${:.2}, hidden depth ≈ {} contracts)",
+                (yt + nt) as f64 / 100.0,
+                crossed_size
+            );
+        }
     }
 
     use std::io::Write;
