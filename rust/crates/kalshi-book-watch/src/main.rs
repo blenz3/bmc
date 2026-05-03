@@ -270,9 +270,16 @@ fn load_credentials(cli: &Cli) -> Result<Option<kalshi_ws::Credentials>> {
 
 // -- Order book + rendering ---------------------------------------------------
 
+/// Internal price unit: 1/10000 of a dollar (one "deci-cent" tick) so the book
+/// represents Kalshi's full sub-penny precision losslessly. The wire format
+/// supports up to 4 decimal places — `linear_cent` markets use $0.01 ticks
+/// (multiples of 100 here), `deci_cent` and `tapered_deci_cent` markets use
+/// $0.001 ticks (multiples of 10).
+const PRICE_DENOM: i64 = 10_000;
+
 #[derive(Default)]
 struct Book {
-    /// Price (in cents, 1..=99) → size in fixed-point contracts.
+    /// Price (in deci-cents, 1..=PRICE_DENOM-1) → size in fixed-point contracts.
     yes: BTreeMap<i64, i64>,
     no: BTreeMap<i64, i64>,
     last_seq: Option<u64>,
@@ -329,8 +336,9 @@ impl Book {
         }
     }
 
-    /// YES-equivalent asks derived from NO bids (`ask_price = 100 - no_bid_price`),
-    /// in ascending price order (best/lowest first), capped to `depth`.
+    /// YES-equivalent asks derived from NO bids
+    /// (`ask_price = PRICE_DENOM - no_bid_price`), in ascending price order
+    /// (best/lowest first), capped to `depth`.
     ///
     /// Filters out asks that don't strictly exceed the best YES bid. Without
     /// this filter, deep standing NO bids at e.g. $0.99 appear as YES asks at
@@ -342,12 +350,12 @@ impl Book {
         let best_yes_bid = self.best_yes_bid().unwrap_or(0);
         self.no
             .iter()
-            .filter(|(&no_p, _)| (100 - no_p) > best_yes_bid)
+            .filter(|(&no_p, _)| (PRICE_DENOM - no_p) > best_yes_bid)
             // Keys ascending → after filter, .rev() iterates descending no_p,
             // i.e., ascending YES ask price. Best (lowest) ask first.
             .rev()
             .take(depth)
-            .map(|(&no_p, &s)| (100 - no_p, s))
+            .map(|(&no_p, &s)| (PRICE_DENOM - no_p, s))
             .collect()
     }
 
@@ -355,7 +363,7 @@ impl Book {
     /// `best_ask_cap` filters out bids that would cross the displayed asks (any
     /// such bid is an obviously stale / self-protected entry).
     fn unified_bids(&self, depth: usize, best_ask_cap: Option<i64>) -> Vec<(i64, i64)> {
-        let upper = best_ask_cap.unwrap_or(101); // 101 > any valid price
+        let upper = best_ask_cap.unwrap_or(PRICE_DENOM + 1); // > any valid price
         self.yes
             .iter()
             .filter(|(&p, _)| p < upper)
@@ -371,7 +379,7 @@ impl Book {
 }
 
 fn price_key(p: f64) -> i64 {
-    (p * 100.0).round() as i64
+    (p * PRICE_DENOM as f64).round() as i64
 }
 
 async fn run_watcher(
@@ -439,10 +447,11 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
 
     match (best_bid, best_ask) {
         (Some(b), Some(a)) => {
-            let mid = (b + a) as f64 / 2.0 / 100.0;
-            let spread = (a - b) as f64 / 100.0;
+            let denom = PRICE_DENOM as f64;
+            let mid = (b + a) as f64 / 2.0 / denom;
+            let spread = (a - b) as f64 / denom;
             println!(
-                "{}  mid ${:.3}  spread ${:.2}",
+                "{}  mid ${:.4}  spread ${:.4}",
                 "─".repeat(14),
                 mid,
                 spread
@@ -460,11 +469,11 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
     let raw_no_top = book.no.keys().next_back().copied();
     let raw_yes_top = book.yes.keys().next_back().copied();
     if let (Some(yt), Some(nt)) = (raw_yes_top, raw_no_top) {
-        if yt + nt > 100 {
+        if yt + nt > PRICE_DENOM {
             let crossed_size: i64 = book
                 .no
                 .iter()
-                .filter(|(&p, _)| (100 - p) <= yt)
+                .filter(|(&p, _)| (PRICE_DENOM - p) <= yt)
                 .map(|(_, &s)| s)
                 .sum::<i64>()
                 + book
@@ -474,8 +483,8 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
                     .map(|(_, &s)| s)
                     .sum::<i64>();
             println!(
-                "(crossed: yes_bid_top + no_bid_top = ${:.2}, hidden depth ≈ {} contracts)",
-                (yt + nt) as f64 / 100.0,
+                "(crossed: yes_bid_top + no_bid_top = ${:.4}, hidden depth ≈ {} contracts)",
+                (yt + nt) as f64 / PRICE_DENOM as f64,
                 crossed_size
             );
         }
@@ -485,6 +494,6 @@ fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
     let _ = std::io::stdout().flush();
 }
 
-fn fmt_price(cents: i64) -> String {
-    format!("${:.2}", cents as f64 / 100.0)
+fn fmt_price(ticks: i64) -> String {
+    format!("${:.4}", ticks as f64 / PRICE_DENOM as f64)
 }
