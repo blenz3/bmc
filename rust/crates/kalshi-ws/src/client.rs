@@ -88,11 +88,11 @@ impl ReconnectPolicy {
             0
         } else {
             // Cheap pseudo-jitter from system clock — we don't need crypto-grade.
-            (std::time::SystemTime::now()
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos() as u64)
                 .unwrap_or(0)
-                % jitter_ms)
+                % jitter_ms
         };
         capped + Duration::from_millis(extra)
     }

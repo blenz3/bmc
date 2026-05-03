@@ -17,11 +17,14 @@ bmc/
       kalshi-rest/                   # async REST client (orders, positions, balance, fills history)
       kalshi-refdata-download/       # binary: pulls /series /events /markets via REST → NDJSON
       kalshi-book-watch/             # binary: live L2 orderbook for the latest market in a series
+      kalshi-cli/                    # binary: command-line wrapper over kalshi-rest (balance, positions, orders, place, cancel, decrease)
       strategy-*/                    # trading strategies (planned)
   scripts/                           # cross-cutting PowerShell wrappers
     build-all.ps1                    # builds every package across all languages
+    kalshi-cli.ps1                   # REST trading CLI wrapper (balance, positions, orders, place, cancel, decrease)
     kalshi-download-refdata.ps1      # snapshots into refdata/<YYYYMMDD>/kalshi/
     kalshi-watch-btc.ps1             # live L2 orderbook for the latest BTC 15-min contract
+    kalshi_test_order.ps1            # one-off: buy ~$1 of contracts on the favored side of the active BTC 15-min market
   refdata/                           # downloaded reference NDJSON, layout: <YYYYMMDD>/<source>/
   CLAUDE.md, README.md
   # python/, notebooks/, sql/ — added when needed, not before

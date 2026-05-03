@@ -1,0 +1,24 @@
+[package]
+name = "kalshi-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line interface for the Kalshi REST trading API: balance, positions, orders, fills"
+
+[[bin]]
+name = "kalshi-cli"
+path = "src/main.rs"
+
+[dependencies]
+kalshi-rest = { workspace = true }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -92,21 +92,6 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let target = match &cli.ticker {
-        Some(t) => MarketTarget {
-            ticker: t.clone(),
-            close_time: None,
-        },
-        None => discover_latest(&cli)
-            .await
-            .with_context(|| format!("discovering latest market for {}", cli.series_ticker))?,
-    };
-    info!(
-        "watching market {} (closes {})",
-        target.ticker,
-        target.close_time.as_deref().unwrap_or("unknown")
-    );
-
     let creds = load_credentials(&cli)?;
     let mut builder = Client::builder().environment(cli.env.ws_environment());
     if let Some(c) = creds {
@@ -117,13 +102,53 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to Kalshi WebSocket")?;
 
-    let sub = client
-        .subscribe_orderbook(vec![target.ticker.clone()])
-        .await
-        .context("subscribing to orderbook_delta")?;
-
     let render = Duration::from_millis(cli.render_interval_ms);
-    run_watcher(target, sub, cli.depth, render).await?;
+    let user_pinned_ticker = cli.ticker.is_some();
+
+    // Outer loop drives auto-rediscover when a contract closes. For
+    // high-frequency series (BTC 15-min) the contract being watched expires
+    // every 15 minutes — we transparently roll over to the next one.
+    loop {
+        let target = match &cli.ticker {
+            Some(t) => MarketTarget {
+                ticker: t.clone(),
+                close_time: None,
+            },
+            None => discover_latest(&cli)
+                .await
+                .with_context(|| format!("discovering latest market for {}", cli.series_ticker))?,
+        };
+        info!(
+            "watching market {} (closes {})",
+            target.ticker,
+            target.close_time.as_deref().unwrap_or("unknown")
+        );
+
+        let sub = client
+            .subscribe_orderbook(vec![target.ticker.clone()])
+            .await
+            .context("subscribing to orderbook_delta")?;
+
+        let outcome = run_watcher(target, sub, cli.depth, render).await?;
+
+        match outcome {
+            WatcherOutcome::UserExit => break,
+            WatcherOutcome::ContractClosed => {
+                if user_pinned_ticker {
+                    info!("contract closed; --ticker pinned, exiting");
+                    break;
+                }
+                info!("contract closed; rediscovering next window");
+                // Brief pause so we don't immediately retry against an empty book.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            WatcherOutcome::StreamEnded => {
+                warn!("subscription stream ended unexpectedly; reconnecting");
+                continue;
+            }
+        }
+    }
 
     client.shutdown();
     Ok(())
@@ -382,30 +407,71 @@ fn price_key(p: f64) -> i64 {
     (p * PRICE_DENOM as f64).round() as i64
 }
 
+/// How `run_watcher` returned. Lets `main` decide whether to rediscover, retry,
+/// or exit.
+#[derive(Debug)]
+enum WatcherOutcome {
+    /// User pressed Ctrl+C — exit cleanly.
+    UserExit,
+    /// `target.close_time` has passed; the watched contract is over. The caller
+    /// should rediscover the next window.
+    ContractClosed,
+    /// The subscription stream ended (Kalshi closed it or the supervisor gave
+    /// up). Caller may want to resubscribe.
+    StreamEnded,
+}
+
 async fn run_watcher(
     target: MarketTarget,
     mut sub: Subscription<OrderbookEvent>,
     depth: usize,
     render_interval: Duration,
-) -> Result<()> {
+) -> Result<WatcherOutcome> {
     let mut book = Book::default();
-    let mut last_render = std::time::Instant::now() - render_interval;
+    let mut last_render = std::time::Instant::now()
+        .checked_sub(render_interval)
+        .unwrap_or_else(std::time::Instant::now);
+    let mut last_event_at: Option<std::time::Instant> = None;
     let mut received = 0u64;
+
+    let close_at_ms = target.close_time.as_deref().and_then(parse_iso_to_unix);
+
+    // Heartbeat tick keeps the screen alive even when no events arrive — the
+    // "last update Xs ago" timestamp keeps moving — and lets us check
+    // `close_time` without depending on event arrival.
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nshutting down on Ctrl+C");
-                return Ok(());
+                return Ok(WatcherOutcome::UserExit);
+            }
+            _ = heartbeat.tick() => {
+                if let Some(close_ms) = close_at_ms {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    // 2-second grace so settlement-edge frames have a chance
+                    // to land before we tear down the subscription.
+                    if now_ms > close_ms + 2_000 {
+                        return Ok(WatcherOutcome::ContractClosed);
+                    }
+                }
+                render(&target, &book, depth, received, last_event_at, close_at_ms);
+                last_render = std::time::Instant::now();
             }
             evt = sub.next() => {
                 let Some(evt) = evt else {
-                    return Err(anyhow!("subscription stream ended"));
+                    return Ok(WatcherOutcome::StreamEnded);
                 };
                 book.apply(&evt);
                 received += 1;
+                last_event_at = Some(std::time::Instant::now());
                 if last_render.elapsed() >= render_interval {
-                    render(&target, &book, depth, received);
+                    render(&target, &book, depth, received, last_event_at, close_at_ms);
                     last_render = std::time::Instant::now();
                 }
             }
@@ -413,16 +479,46 @@ async fn run_watcher(
     }
 }
 
-fn render(target: &MarketTarget, book: &Book, depth: usize, received: u64) {
+fn render(
+    target: &MarketTarget,
+    book: &Book,
+    depth: usize,
+    received: u64,
+    last_event_at: Option<std::time::Instant>,
+    close_at_ms: Option<i64>,
+) {
     // Move cursor home + clear from there. Avoids the full-screen-clear flicker
     // on terminals that don't double-buffer.
     print!("\x1B[H\x1B[2J");
 
     println!("=== {} ===", target.ticker);
     if let Some(close) = &target.close_time {
-        println!("closes {close}");
+        let countdown = close_at_ms
+            .and_then(|ms| {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as i64;
+                Some(ms - now_ms)
+            })
+            .map(|delta_ms| {
+                if delta_ms < 0 {
+                    "(closed)".to_string()
+                } else {
+                    let s = delta_ms / 1000;
+                    format!("(closes in {}m {:02}s)", s / 60, s % 60)
+                }
+            })
+            .unwrap_or_default();
+        println!("closes {close}  {countdown}");
     }
-    println!("seq {:?}   updates received {}", book.last_seq, received);
+    let freshness = last_event_at
+        .map(|t| format!("last event {:.1}s ago", t.elapsed().as_secs_f64()))
+        .unwrap_or_else(|| "no events yet".into());
+    println!(
+        "seq {:?}   updates received {}   {}",
+        book.last_seq, received, freshness
+    );
     println!();
 
     // Unified YES-centric book, filtered to non-crossing entries:

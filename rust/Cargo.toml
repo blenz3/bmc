@@ -18,6 +18,7 @@ license = "MIT OR Apache-2.0"
 # Internal crates — strategies depend on these via path.
 kalshi-ws = { path = "crates/kalshi-ws" }
 kalshi-rest = { path = "crates/kalshi-rest" }
+kalshi-cli = { path = "crates/kalshi-cli" }
 
 # Async runtime + WebSocket
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

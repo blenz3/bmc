@@ -227,7 +227,7 @@ pub fn new_client_order_id() -> String {
 
 // -- Order response -----------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     pub order_id: String,
     pub user_id: String,
@@ -270,7 +270,7 @@ pub struct Order {
     pub subaccount_number: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListOrdersFilter {
     pub ticker: Option<String>,
     pub event_ticker: Option<String>,
@@ -292,7 +292,7 @@ pub struct Page<T> {
 
 // -- Positions ----------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPosition {
     pub ticker: String,
     #[serde(default, deserialize_with = "f64_or_str_opt")]
@@ -309,7 +309,7 @@ pub struct MarketPosition {
     pub resting_orders_count: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventPosition {
     pub event_ticker: String,
     #[serde(default, deserialize_with = "f64_or_str_opt")]
@@ -324,7 +324,7 @@ pub struct EventPosition {
     pub fees_paid_dollars: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Positions {
     #[serde(default)]
     pub market_positions: Vec<MarketPosition>,
@@ -335,7 +335,7 @@ pub struct Positions {
 
 // -- Balance ------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Balance {
     /// Available balance in dollars.
     #[serde(default, deserialize_with = "f64_or_str_opt")]
@@ -352,7 +352,7 @@ pub struct Balance {
 
 // -- Fills --------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fill {
     pub trade_id: String,
     pub order_id: String,
