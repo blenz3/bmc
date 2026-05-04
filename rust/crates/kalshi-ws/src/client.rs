@@ -331,8 +331,14 @@ impl Client {
         &self,
         market_tickers: Vec<String>,
     ) -> Result<Subscription<OrderbookEvent>> {
+        // `send_initial_snapshot: Some(true)` is essential here: it's also
+        // copied by replay_subscriptions on reconnect, guaranteeing Kalshi
+        // re-sends a fresh snapshot on the new sid. Without it, callers
+        // maintaining a local book would race a stale book against incoming
+        // deltas after every supervisor-driven reconnect.
         let params = SubscribeParams {
             market_tickers: opt_vec(&market_tickers),
+            send_initial_snapshot: Some(true),
             ..SubscribeParams::default()
         };
         self.subscribe_typed(

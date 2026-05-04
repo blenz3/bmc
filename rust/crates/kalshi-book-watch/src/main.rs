@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use kalshi_ws::{Client, Environment, OrderbookEvent, Side, Subscription};
+use kalshi_ws::{Client, Environment, OrderbookEvent, Side, Subscription, SystemEvent};
 use serde::Deserialize;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 /// Default targets BTC 15-minute markets (`KXBTC15M`). Other Kalshi BTC series:
@@ -327,6 +328,12 @@ struct Book {
     gaps_observed: u64,
     snapshots_applied: u64,
     deltas_applied: u64,
+    /// When the most recent snapshot was applied. Used by the reconnect
+    /// handler to disambiguate the snapshot-vs-Reconnected race: if a
+    /// snapshot just landed (Order A), we don't want to clear the book it
+    /// just populated; if it hasn't (Order B), we clear so the renderer
+    /// doesn't show stale levels until Kalshi's resubscribe-snapshot lands.
+    last_snapshot_at: Option<std::time::Instant>,
 }
 
 impl Book {
@@ -341,7 +348,17 @@ impl Book {
             gaps_observed: 0,
             snapshots_applied: 0,
             deltas_applied: 0,
+            last_snapshot_at: None,
         }
+    }
+
+    /// Wipe levels and seq tracking. Used on reconnect when the server-side
+    /// state diverges from ours and a fresh snapshot is en route — rendering
+    /// an empty book briefly is preferable to rendering known-stale levels.
+    fn reset(&mut self) {
+        self.inner.clear();
+        self.last_seq = None;
+        self.last_update_ms = None;
     }
 
     /// Applies an event and returns `Some(SeqGap)` if the event's seq number
@@ -383,6 +400,7 @@ impl Book {
                 );
                 self.last_update_ms = snapshot.ts_ms;
                 self.snapshots_applied += 1;
+                self.last_snapshot_at = Some(std::time::Instant::now());
                 // Log the post-snapshot top of book so we can tell whether a
                 // crossed view comes from the snapshot itself (Kalshi-side
                 // weirdness) or from accumulated delta state.
@@ -505,6 +523,13 @@ async fn run_watcher(
     // Throttle resync requests so a sustained gap doesn't spam the server.
     let mut last_resync_request: Option<std::time::Instant> = None;
     const RESYNC_COOLDOWN: Duration = Duration::from_secs(5);
+    // Window for distinguishing the snapshot-vs-Reconnected race. Kalshi's
+    // resubscribe snapshot typically lands within ~100ms of the Subscribed
+    // ack; if we've just applied one we trust it and don't re-clear the book.
+    const RECONNECT_SNAPSHOT_WINDOW: Duration = Duration::from_millis(750);
+
+    let our_sub_id = sub.id;
+    let mut sys_events = client.system_events();
 
     let close_at_ms = target.close_time.as_deref().and_then(parse_iso_to_unix);
 
@@ -519,6 +544,37 @@ async fn run_watcher(
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nshutting down on Ctrl+C");
                 return Ok(WatcherOutcome::UserExit);
+            }
+            sys_evt = sys_events.recv() => {
+                match sys_evt {
+                    Ok(SystemEvent::Reconnected { sub_id, had_seq_gap }) if sub_id == our_sub_id => {
+                        // The supervisor just replayed our subscription on a
+                        // fresh sid. Kalshi will send a new snapshot (we set
+                        // send_initial_snapshot=true on subscribe); until it
+                        // arrives, the local book is potentially stale. Race:
+                        // if the snapshot landed *first* and Reconnected after
+                        // (tokio scheduling), don't blow it away.
+                        let just_snapshotted = book.last_snapshot_at
+                            .map(|t| t.elapsed() < RECONNECT_SNAPSHOT_WINDOW)
+                            .unwrap_or(false);
+                        if just_snapshotted {
+                            warn!(had_seq_gap, "reconnected; fresh snapshot already applied, leaving book");
+                        } else {
+                            warn!(had_seq_gap, "reconnected; clearing book until snapshot arrives");
+                            book.reset();
+                        }
+                        // Reset throttle so we can immediately request a snapshot
+                        // if the auto-snapshot from Kalshi doesn't materialize.
+                        last_resync_request = None;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("system events lagged by {n}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Client shut down; let sub.next() observe end-of-stream.
+                    }
+                }
             }
             _ = heartbeat.tick() => {
                 if let Some(close_ms) = close_at_ms {
@@ -591,9 +647,11 @@ fn render(
     last_event_at: Option<std::time::Instant>,
     close_at_ms: Option<i64>,
 ) {
-    // Move cursor home + clear from there. Avoids the full-screen-clear flicker
-    // on terminals that don't double-buffer.
-    print!("\x1B[H\x1B[2J");
+    // Cursor home, clear visible screen, then clear scrollback. \x1B[3J is the
+    // XTerm/Windows-Terminal extension that wipes the scrollback buffer —
+    // without it, every redraw scrolls the previous frame upward where it
+    // remains visible if the user scrolls up, masquerading as "stale levels".
+    print!("\x1B[H\x1B[2J\x1B[3J");
 
     println!("=== {} ===", target.ticker);
     if let Some(close) = &target.close_time {
