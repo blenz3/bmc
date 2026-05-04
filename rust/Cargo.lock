@@ -781,6 +781,7 @@ name = "kalshi-common"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -802,6 +803,7 @@ dependencies = [
 name = "kalshi-rest"
 version = "0.1.0"
 dependencies = [
+ "kalshi-common",
  "kalshi-ws",
  "rand 0.8.6",
  "reqwest",
@@ -821,6 +823,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "futures-util",
+ "kalshi-common",
  "rand 0.8.6",
  "rsa",
  "serde",

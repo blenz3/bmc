@@ -300,7 +300,7 @@ fn load_credentials(cli: &Cli) -> Result<Option<kalshi_ws::Credentials>> {
 // emptied) is a contiguous walk over an L1-resident array.
 
 use kalshi_common::book::{FixedBook, Side as BookSide};
-use kalshi_common::DECI_CENTS_PER_DOLLAR;
+use kalshi_common::{dollars_to_deci_cents, DECI_CENTS_PER_DOLLAR};
 use kalshi_ws::UpdateAction;
 
 /// Returned by `Book::apply` when a delta's seq number doesn't equal
@@ -470,8 +470,9 @@ fn book_side(s: Side) -> BookSide {
     }
 }
 
+#[inline]
 fn price_key(p: f64) -> i64 {
-    (p * PRICE_DENOM as f64).round() as i64
+    dollars_to_deci_cents(p)
 }
 
 /// How `run_watcher` returned. Lets `main` decide whether to rediscover, retry,

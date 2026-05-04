@@ -13,6 +13,8 @@ path = "src/lib.rs"
 [dependencies]
 # Reuses Credentials::signed_headers and the shared Side enum.
 kalshi-ws = { workspace = true }
+# Number-or-string serde helpers shared with kalshi-ws.
+kalshi-common = { workspace = true, features = ["serde"] }
 
 tokio = { workspace = true }
 reqwest = { workspace = true }

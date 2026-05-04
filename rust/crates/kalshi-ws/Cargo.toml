@@ -14,6 +14,8 @@ name = "kalshi_ws"
 path = "src/lib.rs"
 
 [dependencies]
+kalshi-common = { workspace = true, features = ["serde"] }
+
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-stream = { workspace = true }

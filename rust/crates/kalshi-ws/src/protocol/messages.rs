@@ -9,73 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::channels::Side;
 
-/// Tolerant numeric deserializers. Kalshi's production wire serializes most
-/// `_dollars` and `_fp` fields as JSON strings (`"0.5500"`, `"33413.00"`),
-/// but the docs and some endpoints still ship plain numbers. These helpers
-/// accept either form.
-///
-/// Apply with `#[serde(deserialize_with = "num_serde::as_f64")]` etc. on the
-/// field. Serialization continues to use serde's default (writes a number).
-mod num_serde {
-    use serde::{de::Error as DeError, Deserialize, Deserializer};
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    pub(super) enum NumOrStr {
-        Num(f64),
-        Str(String),
-    }
-
-    pub(super) fn to_f64<E: DeError>(v: NumOrStr) -> Result<f64, E> {
-        match v {
-            NumOrStr::Num(n) => Ok(n),
-            NumOrStr::Str(s) => s.parse::<f64>().map_err(E::custom),
-        }
-    }
-
-    pub(super) fn to_i64<E: DeError>(v: NumOrStr) -> Result<i64, E> {
-        match v {
-            NumOrStr::Num(n) => Ok(n as i64),
-            // Accept "33413.00" or similar by parsing as f64 then truncating.
-            NumOrStr::Str(s) => s
-                .parse::<f64>()
-                .map(|f| f as i64)
-                .map_err(E::custom),
-        }
-    }
-
-    pub fn as_f64<'de, D>(d: D) -> Result<f64, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        to_f64::<D::Error>(NumOrStr::deserialize(d)?)
-    }
-
-    pub fn as_f64_opt<'de, D>(d: D) -> Result<Option<f64>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<NumOrStr>::deserialize(d)?
-            .map(to_f64::<D::Error>)
-            .transpose()
-    }
-
-    pub fn as_i64<'de, D>(d: D) -> Result<i64, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        to_i64::<D::Error>(NumOrStr::deserialize(d)?)
-    }
-
-    pub fn as_i64_opt<'de, D>(d: D) -> Result<Option<i64>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<NumOrStr>::deserialize(d)?
-            .map(to_i64::<D::Error>)
-            .transpose()
-    }
-}
+// Tolerant number-or-string deserializers live in `kalshi_common::serde_num`;
+// the same helpers are also used by kalshi-rest for its REST payloads.
+use kalshi_common::serde_num as num_serde;
 
 /// All possible server frames, internally tagged on the `type` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,7 +219,7 @@ pub type PriceLevel = (f64, i64);
 /// Tolerant deserialization for `[price, size]` price-level arrays. Reuses
 /// the [`num_serde`] number-or-string parsers for each tuple element.
 mod price_levels_serde {
-    use super::num_serde::{to_f64, to_i64, NumOrStr};
+    use kalshi_common::serde_num::{to_f64, to_i64, NumOrStr};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn deserialize<'de, D>(d: D) -> Result<Vec<(f64, i64)>, D::Error>

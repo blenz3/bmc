@@ -694,6 +694,10 @@ async fn supervisor_loop(
 ) {
     let mut current = Some(initial);
     let mut attempt: u32 = 0;
+    // Tracks the in-flight replay task spawned on the most recent reconnect.
+    // Aborted before spawning a new replay so a fast disconnect-reconnect
+    // cycle can't leave a stale replay queueing duplicate subscribes.
+    let mut replay_task: Option<JoinHandle<()>> = None;
 
     loop {
         if inner.cancel.is_cancelled() {
@@ -726,7 +730,25 @@ async fn supervisor_loop(
                 match connect(&inner.config.environment, inner.config.credentials.as_ref()).await {
                     Ok(ws) => {
                         attempt = 0;
-                        replay_subscriptions(&inner).await;
+                        // Replay must run *concurrently* with run_session, not
+                        // before it. Replay sends Subscribe commands into
+                        // inner.cmd_tx and awaits Subscribed acks via oneshots;
+                        // both directions only flow once run_session is
+                        // draining cmd_rx and reading the new ws stream. If we
+                        // awaited replay here, every per-sub ack would time out
+                        // (default 15s), pending_subscribes entries would be
+                        // cleaned up, and when run_session finally drained the
+                        // queued subscribes the resulting acks would land with
+                        // nothing to match — the new sids would never be
+                        // registered and every data frame after reconnect would
+                        // be silently dropped.
+                        if let Some(handle) = replay_task.take() {
+                            handle.abort();
+                        }
+                        let inner_for_replay = inner.clone();
+                        replay_task = Some(tokio::spawn(async move {
+                            replay_subscriptions(&inner_for_replay).await;
+                        }));
                         ws
                     }
                     Err(e) => {
@@ -749,6 +771,9 @@ async fn supervisor_loop(
         }
     }
 
+    if let Some(handle) = replay_task.take() {
+        handle.abort();
+    }
     let _ = inner.events_tx.send(SystemEvent::ShutDown);
 }
 

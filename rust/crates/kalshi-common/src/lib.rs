@@ -25,6 +25,9 @@ pub mod fees;
 pub mod price;
 pub mod prob;
 
+#[cfg(feature = "serde")]
+pub mod serde_num;
+
 pub use book::{BookError, BookIter, FixedBook, Side as BookSide};
 pub use fees::{
     fee_dollars, maker_fee_dollars, round_trip_fee_dollars, taker_fee_dollars, FeeKind,

@@ -3,7 +3,11 @@
     "allow": [
       "WebFetch(domain:trading-api.readme.io)",
       "WebSearch",
-      "WebFetch(domain:docs.kalshi.com)"
+      "WebFetch(domain:docs.kalshi.com)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(git stash *)",
+      "Bash(cargo clippy *)"
     ]
   }
 }

@@ -10,8 +10,9 @@
 //! - `_fp` fields are fixed-point integers (whole-contract counts), parsed
 //!   from either JSON number or string into `i64`.
 
+use kalshi_common::serde_num::{as_f64_opt as f64_or_str_opt, as_i64_opt as i64_or_str_opt};
 use kalshi_ws::Side;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 // -- Enums --------------------------------------------------------------------
 
@@ -372,50 +373,6 @@ pub struct Fill {
     pub created_time: Option<String>,
 }
 
-// -- Number-or-string deserializers ------------------------------------------
-//
-// Kalshi's `FixedPointDollars` / `FixedPointCount` types serialize as JSON
-// strings on some endpoints, plain numbers on others. These helpers tolerate
-// either rather than forcing the caller to handle two shapes.
-
-fn f64_or_str_opt<'de, D>(d: D) -> std::result::Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Either {
-        Num(f64),
-        Str(String),
-    }
-    Option::<Either>::deserialize(d)?
-        .map(|e| match e {
-            Either::Num(n) => Ok(n),
-            Either::Str(s) => s.parse::<f64>().map_err(serde::de::Error::custom),
-        })
-        .transpose()
-}
-
-fn i64_or_str_opt<'de, D>(d: D) -> std::result::Result<Option<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Either {
-        Num(i64),
-        Str(String),
-    }
-    Option::<Either>::deserialize(d)?
-        .map(|e| match e {
-            Either::Num(n) => Ok(n),
-            // Tolerate `"10.00"` style fixed-point by truncating fractional part.
-            Either::Str(s) => s
-                .split('.')
-                .next()
-                .unwrap_or("0")
-                .parse::<i64>()
-                .map_err(serde::de::Error::custom),
-        })
-        .transpose()
-}
+// Number-or-string deserializers live in `kalshi_common::serde_num`. We pull
+// the optional variants in at the top of this file as `f64_or_str_opt` /
+// `i64_or_str_opt` to keep the per-field annotations unchanged.
