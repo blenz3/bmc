@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 kalshi-ws = { workspace = true }
+kalshi-common = { workspace = true }
 
 tokio = { workspace = true, features = ["signal"] }
 reqwest = { workspace = true }

@@ -13,6 +13,7 @@ bmc/
   rust/                              # Rust workspace
     Cargo.toml                       # [workspace] members + shared deps
     crates/
+      kalshi-common/                 # pure-std utilities: fee math, price-unit conversion, mid/spread, tick rounding
       kalshi-ws/                     # async WebSocket client library (market data, fills feed)
       kalshi-rest/                   # async REST client (orders, positions, balance, fills history)
       kalshi-refdata-download/       # binary: pulls /series /events /markets via REST → NDJSON

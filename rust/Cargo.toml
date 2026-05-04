@@ -16,6 +16,7 @@ license = "MIT OR Apache-2.0"
 #   tokio = { workspace = true, features = ["test-util"] }
 [workspace.dependencies]
 # Internal crates — strategies depend on these via path.
+kalshi-common = { path = "crates/kalshi-common" }
 kalshi-ws = { path = "crates/kalshi-ws" }
 kalshi-rest = { path = "crates/kalshi-rest" }
 kalshi-cli = { path = "crates/kalshi-cli" }

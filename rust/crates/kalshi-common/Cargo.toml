@@ -1,0 +1,20 @@
+[package]
+name = "kalshi-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared utilities for Kalshi: fee math, price/probability conversion, orderbook math"
+
+[lib]
+name = "kalshi_common"
+path = "src/lib.rs"
+
+[dependencies]
+# Pure-std crate. Adding optional serde derives behind a feature lets callers
+# serialize fee breakdowns without forcing serde on every consumer.
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

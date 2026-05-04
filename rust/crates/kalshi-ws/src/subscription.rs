@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use futures_util::Stream;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::protocol::commands::{ClientCommand, UnsubscribeParams};
 
@@ -66,9 +66,15 @@ pub enum SystemEvent {
 
 /// A typed stream of one channel's events, scoped to a single subscription.
 ///
+/// Backed by an **unbounded** mpsc — the multiplexer's dispatcher always
+/// successfully enqueues the next event regardless of consumer speed, so
+/// there's no silent-drop path. If the consumer permanently stalls, memory
+/// will grow with the inflow rate; in practice the supervisor's connection
+/// timeouts catch a stuck consumer well before that becomes a problem.
+///
 /// Dropping the `Subscription` issues a best-effort `unsubscribe` to the server.
 pub struct Subscription<T> {
-    inner: ReceiverStream<T>,
+    inner: UnboundedReceiverStream<T>,
     pub id: SubscriptionId,
     pub(crate) cmd_tx: mpsc::Sender<ClientCommand>,
     pub(crate) registry: Arc<Mutex<crate::client::SubRegistry>>,
@@ -78,13 +84,13 @@ pub struct Subscription<T> {
 impl<T> Subscription<T> {
     pub(crate) fn new(
         id: SubscriptionId,
-        rx: mpsc::Receiver<T>,
+        rx: mpsc::UnboundedReceiver<T>,
         cmd_tx: mpsc::Sender<ClientCommand>,
         registry: Arc<Mutex<crate::client::SubRegistry>>,
         ids: Arc<IdGenerator>,
     ) -> Self {
         Self {
-            inner: ReceiverStream::new(rx),
+            inner: UnboundedReceiverStream::new(rx),
             id,
             cmd_tx,
             registry,

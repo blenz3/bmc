@@ -752,6 +752,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "kalshi-common",
  "kalshi-ws",
  "reqwest",
  "serde",
@@ -773,6 +774,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kalshi-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

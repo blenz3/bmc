@@ -13,7 +13,6 @@
 //! `--series-ticker` for other series (`KXBTC` for hourly BTC, `KXETH15M` for
 //! 15-min ETH, etc.) or `--ticker` to skip discovery entirely.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -129,7 +128,7 @@ async fn main() -> Result<()> {
             .await
             .context("subscribing to orderbook_delta")?;
 
-        let outcome = run_watcher(target, sub, cli.depth, render).await?;
+        let outcome = run_watcher(&client, target, sub, cli.depth, render).await?;
 
         match outcome {
             WatcherOutcome::UserExit => break,
@@ -294,112 +293,180 @@ fn load_credentials(cli: &Cli) -> Result<Option<kalshi_ws::Credentials>> {
 }
 
 // -- Order book + rendering ---------------------------------------------------
+//
+// Backed by `kalshi_common::book::FixedBook` — a preallocated 10_000-level
+// flat-array L2 book. Apply/delta is O(1), top-of-book lookup is O(1) via a
+// cached best index, and the only sub-O(1) path (rescan after the top is
+// emptied) is a contiguous walk over an L1-resident array.
 
-/// Internal price unit: 1/10000 of a dollar (one "deci-cent" tick) so the book
-/// represents Kalshi's full sub-penny precision losslessly. The wire format
-/// supports up to 4 decimal places — `linear_cent` markets use $0.01 ticks
-/// (multiples of 100 here), `deci_cent` and `tapered_deci_cent` markets use
-/// $0.001 ticks (multiples of 10).
-const PRICE_DENOM: i64 = 10_000;
+use kalshi_common::book::{FixedBook, Side as BookSide};
+use kalshi_common::DECI_CENTS_PER_DOLLAR;
+use kalshi_ws::UpdateAction;
 
-#[derive(Default)]
+/// Returned by `Book::apply` when a delta's seq number doesn't equal
+/// `last_seq + 1`. A gap means we missed at least one delta, so the local
+/// book is out of sync with the server -- caller should request a fresh
+/// snapshot to resync.
+#[derive(Debug, Clone, Copy)]
+struct SeqGap {
+    expected: u64,
+    got: u64,
+}
+
+/// Internal price unit: 1/10000 of a dollar. Sub-penny markets resolve at
+/// $0.001 ticks; storing in deci-cents preserves that losslessly.
+const PRICE_DENOM: i64 = DECI_CENTS_PER_DOLLAR;
+
 struct Book {
-    /// Price (in deci-cents, 1..=PRICE_DENOM-1) → size in fixed-point contracts.
-    yes: BTreeMap<i64, i64>,
-    no: BTreeMap<i64, i64>,
+    inner: FixedBook,
     last_seq: Option<u64>,
     last_update_ms: Option<i64>,
+    /// Cumulative count of seq-number gaps observed. Each gap means we lost
+    /// at least one delta and the local book diverged from the server until
+    /// the next snapshot arrives.
+    gaps_observed: u64,
+    snapshots_applied: u64,
+    deltas_applied: u64,
 }
 
 impl Book {
-    fn apply(&mut self, evt: &OrderbookEvent) {
+    fn new() -> Self {
+        Self {
+            // 10_000 deci-cent levels covers both `linear_cent` (uses every
+            // 100th level) and `deci_cent` / `tapered_deci_cent` (uses every
+            // 10th or every 1st level). 160 KB memory, fits in L2.
+            inner: FixedBook::deci_cent(),
+            last_seq: None,
+            last_update_ms: None,
+            gaps_observed: 0,
+            snapshots_applied: 0,
+            deltas_applied: 0,
+        }
+    }
+
+    /// Applies an event and returns `Some(SeqGap)` if the event's seq number
+    /// indicates we missed at least one earlier delta. Snapshots reset the
+    /// baseline (no gap reported) since they're authoritative.
+    fn apply(&mut self, evt: &OrderbookEvent) -> Option<SeqGap> {
+        let new_seq = match evt {
+            OrderbookEvent::Snapshot { seq, .. } => *seq,
+            OrderbookEvent::Delta { seq, .. } => *seq,
+        };
+
+        // Gap detection: only deltas (not snapshots) must follow last_seq + 1.
+        let gap = match (evt, self.last_seq) {
+            (OrderbookEvent::Delta { .. }, Some(prev)) if new_seq != prev + 1 => {
+                self.gaps_observed += 1;
+                Some(SeqGap {
+                    expected: prev + 1,
+                    got: new_seq,
+                })
+            }
+            _ => None,
+        };
+
         match evt {
-            OrderbookEvent::Snapshot { seq, snapshot } => {
-                self.yes.clear();
-                self.no.clear();
-                for (price, size) in &snapshot.yes_dollars_fp {
-                    self.set(Side::Yes, *price, *size);
-                }
-                for (price, size) in &snapshot.no_dollars_fp {
-                    self.set(Side::No, *price, *size);
-                }
-                self.last_seq = Some(*seq);
+            OrderbookEvent::Snapshot { snapshot, .. } => {
+                self.inner.replace_side(
+                    BookSide::Yes,
+                    snapshot
+                        .yes_dollars_fp
+                        .iter()
+                        .map(|(price, size)| (price_key(*price) as usize, (*size).max(0) as u64)),
+                );
+                self.inner.replace_side(
+                    BookSide::No,
+                    snapshot
+                        .no_dollars_fp
+                        .iter()
+                        .map(|(price, size)| (price_key(*price) as usize, (*size).max(0) as u64)),
+                );
                 self.last_update_ms = snapshot.ts_ms;
+                self.snapshots_applied += 1;
+                // Log the post-snapshot top of book so we can tell whether a
+                // crossed view comes from the snapshot itself (Kalshi-side
+                // weirdness) or from accumulated delta state.
+                let yb = self.best_yes_bid();
+                let nb = self.best_no_bid();
+                let crossed = match (yb, nb) {
+                    (Some(y), Some(n)) => (y + n).saturating_sub(PRICE_DENOM).max(0),
+                    _ => 0,
+                };
+                info!(
+                    seq = new_seq,
+                    yes_levels = snapshot.yes_dollars_fp.len(),
+                    no_levels = snapshot.no_dollars_fp.len(),
+                    best_yes_bid_dc = ?yb,
+                    best_no_bid_dc = ?nb,
+                    cross_dc = crossed,
+                    "snapshot applied"
+                );
             }
-            OrderbookEvent::Delta { seq, delta } => {
-                self.delta(delta.side, delta.price_dollars, delta.delta_fp);
-                self.last_seq = Some(*seq);
+            OrderbookEvent::Delta { delta, .. } => {
+                let idx = price_key(delta.price_dollars);
+                if let Err(e) = self.inner.apply_delta(
+                    book_side(delta.side),
+                    idx as usize,
+                    delta.delta_fp,
+                ) {
+                    warn!(
+                        seq = new_seq,
+                        price = delta.price_dollars,
+                        idx,
+                        "delta dropped: {e}"
+                    );
+                }
                 self.last_update_ms = delta.ts_ms;
+                self.deltas_applied += 1;
             }
         }
-    }
-
-    fn set(&mut self, side: Side, price: f64, size: i64) {
-        let key = price_key(price);
-        let map = self.side_mut(side);
-        if size > 0 {
-            map.insert(key, size);
-        } else {
-            map.remove(&key);
-        }
-    }
-
-    fn delta(&mut self, side: Side, price: f64, delta: i64) {
-        let key = price_key(price);
-        let map = self.side_mut(side);
-        let entry = map.entry(key).or_insert(0);
-        *entry += delta;
-        if *entry <= 0 {
-            map.remove(&key);
-        }
-    }
-
-    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<i64, i64> {
-        match side {
-            Side::Yes => &mut self.yes,
-            Side::No => &mut self.no,
-        }
+        self.last_seq = Some(new_seq);
+        gap
     }
 
     /// YES-equivalent asks derived from NO bids
-    /// (`ask_price = PRICE_DENOM - no_bid_price`), in ascending price order
-    /// (best/lowest first), capped to `depth`.
-    ///
-    /// Filters out asks that don't strictly exceed the best YES bid. Without
-    /// this filter, deep standing NO bids at e.g. $0.99 appear as YES asks at
-    /// $0.01 — visually below the YES bid book, which inverts the display.
-    /// Such entries represent crossed liquidity (the matching engine should
-    /// have already filled them, or they're protected by self-trade prevention,
-    /// or they're conditional / iceberg orders that don't auto-cross).
+    /// (`ask_price = PRICE_DENOM - no_bid_price`), ascending by price (best/lowest first),
+    /// capped to `depth`. Filters out asks that don't exceed the best YES bid
+    /// (those are crossed entries — see comment in [`Self::unified_bids`]).
     fn unified_asks(&self, depth: usize) -> Vec<(i64, i64)> {
         let best_yes_bid = self.best_yes_bid().unwrap_or(0);
-        self.no
-            .iter()
-            .filter(|(&no_p, _)| (PRICE_DENOM - no_p) > best_yes_bid)
-            // Keys ascending → after filter, .rev() iterates descending no_p,
-            // i.e., ascending YES ask price. Best (lowest) ask first.
-            .rev()
+        // FixedBook.iter() yields (idx, size) descending by price index.
+        // For NO: descending NO price → ascending implied YES ask price (since ask = DENOM - no_p).
+        // So filter, then transform — best (lowest) ask comes out first.
+        self.inner
+            .iter(BookSide::No)
+            .filter(|(no_p, _)| (PRICE_DENOM - *no_p as i64) > best_yes_bid)
             .take(depth)
-            .map(|(&no_p, &s)| (PRICE_DENOM - no_p, s))
+            .map(|(no_p, s)| (PRICE_DENOM - no_p as i64, s as i64))
             .collect()
     }
 
-    /// YES bids in descending price order (best/highest first), capped to `depth`.
-    /// `best_ask_cap` filters out bids that would cross the displayed asks (any
-    /// such bid is an obviously stale / self-protected entry).
+    /// YES bids descending by price (best/highest first), capped to `depth`.
+    /// `best_ask_cap` filters out bids that would cross the displayed asks.
     fn unified_bids(&self, depth: usize, best_ask_cap: Option<i64>) -> Vec<(i64, i64)> {
-        let upper = best_ask_cap.unwrap_or(PRICE_DENOM + 1); // > any valid price
-        self.yes
-            .iter()
-            .filter(|(&p, _)| p < upper)
-            .rev()
+        let upper = best_ask_cap.unwrap_or(PRICE_DENOM + 1);
+        self.inner
+            .iter(BookSide::Yes)
+            .filter(|(p, _)| (*p as i64) < upper)
             .take(depth)
-            .map(|(&p, &s)| (p, s))
+            .map(|(p, s)| (p as i64, s as i64))
             .collect()
     }
 
     fn best_yes_bid(&self) -> Option<i64> {
-        self.yes.keys().next_back().copied()
+        self.inner.best(BookSide::Yes).map(|(idx, _)| idx as i64)
+    }
+
+    fn best_no_bid(&self) -> Option<i64> {
+        self.inner.best(BookSide::No).map(|(idx, _)| idx as i64)
+    }
+}
+
+#[inline]
+fn book_side(s: Side) -> BookSide {
+    match s {
+        Side::Yes => BookSide::Yes,
+        Side::No => BookSide::No,
     }
 }
 
@@ -422,17 +489,21 @@ enum WatcherOutcome {
 }
 
 async fn run_watcher(
+    client: &Client,
     target: MarketTarget,
     mut sub: Subscription<OrderbookEvent>,
     depth: usize,
     render_interval: Duration,
 ) -> Result<WatcherOutcome> {
-    let mut book = Book::default();
+    let mut book = Book::new();
     let mut last_render = std::time::Instant::now()
         .checked_sub(render_interval)
         .unwrap_or_else(std::time::Instant::now);
     let mut last_event_at: Option<std::time::Instant> = None;
     let mut received = 0u64;
+    // Throttle resync requests so a sustained gap doesn't spam the server.
+    let mut last_resync_request: Option<std::time::Instant> = None;
+    const RESYNC_COOLDOWN: Duration = Duration::from_secs(5);
 
     let close_at_ms = target.close_time.as_deref().and_then(parse_iso_to_unix);
 
@@ -467,9 +538,41 @@ async fn run_watcher(
                 let Some(evt) = evt else {
                     return Ok(WatcherOutcome::StreamEnded);
                 };
-                book.apply(&evt);
+                let gap = book.apply(&evt);
                 received += 1;
                 last_event_at = Some(std::time::Instant::now());
+
+                // Seq gap means we missed a delta; the local book has diverged
+                // from the server. Request a fresh snapshot to resync. Throttle
+                // so a sustained gap stream doesn't spam the server.
+                if let Some(g) = gap {
+                    let now = std::time::Instant::now();
+                    let cooldown_passed = last_resync_request
+                        .map(|t| now.duration_since(t) >= RESYNC_COOLDOWN)
+                        .unwrap_or(true);
+                    if cooldown_passed {
+                        warn!(
+                            expected = g.expected,
+                            got = g.got,
+                            gap = g.got.saturating_sub(g.expected),
+                            "seq gap; requesting fresh snapshot"
+                        );
+                        last_resync_request = Some(now);
+                        if let Err(e) = client
+                            .update_subscription(&sub, UpdateAction::GetSnapshot, None)
+                            .await
+                        {
+                            warn!("snapshot resync request failed: {e}");
+                        }
+                    } else {
+                        warn!(
+                            expected = g.expected,
+                            got = g.got,
+                            "seq gap (within resync cooldown -- not re-requesting yet)"
+                        );
+                    }
+                }
+
                 if last_render.elapsed() >= render_interval {
                     render(&target, &book, depth, received, last_event_at, close_at_ms);
                     last_render = std::time::Instant::now();
@@ -515,9 +618,19 @@ fn render(
     let freshness = last_event_at
         .map(|t| format!("last event {:.1}s ago", t.elapsed().as_secs_f64()))
         .unwrap_or_else(|| "no events yet".into());
+    let gap_marker = if book.gaps_observed > 0 {
+        format!("   gaps {}", book.gaps_observed)
+    } else {
+        String::new()
+    };
     println!(
-        "seq {:?}   updates received {}   {}",
-        book.last_seq, received, freshness
+        "seq {:?}   recv {} (snap {} / delta {}){}   {}",
+        book.last_seq,
+        received,
+        book.snapshots_applied,
+        book.deltas_applied,
+        gap_marker,
+        freshness
     );
     println!();
 
@@ -562,22 +675,21 @@ fn render(
 
     // Surface that entries were hidden as crossed liquidity, so the user knows
     // the displayed book isn't the entire raw orderbook.
-    let raw_no_top = book.no.keys().next_back().copied();
-    let raw_yes_top = book.yes.keys().next_back().copied();
-    if let (Some(yt), Some(nt)) = (raw_yes_top, raw_no_top) {
+    if let (Some(yt), Some(nt)) = (book.best_yes_bid(), book.best_no_bid()) {
         if yt + nt > PRICE_DENOM {
-            let crossed_size: i64 = book
-                .no
-                .iter()
-                .filter(|(&p, _)| (PRICE_DENOM - p) <= yt)
-                .map(|(_, &s)| s)
-                .sum::<i64>()
-                + book
-                    .yes
-                    .iter()
-                    .filter(|(&p, _)| best_ask.map_or(false, |a| p >= a))
-                    .map(|(_, &s)| s)
-                    .sum::<i64>();
+            let crossed_no: u64 = book
+                .inner
+                .iter(BookSide::No)
+                .filter(|(p, _)| (PRICE_DENOM - *p as i64) <= yt)
+                .map(|(_, s)| s)
+                .sum();
+            let crossed_yes: u64 = book
+                .inner
+                .iter(BookSide::Yes)
+                .filter(|(p, _)| best_ask.map_or(false, |a| (*p as i64) >= a))
+                .map(|(_, s)| s)
+                .sum();
+            let crossed_size = crossed_no + crossed_yes;
             println!(
                 "(crossed: yes_bid_top + no_bid_top = ${:.4}, hidden depth ≈ {} contracts)",
                 (yt + nt) as f64 / PRICE_DENOM as f64,

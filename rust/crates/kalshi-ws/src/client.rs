@@ -306,9 +306,9 @@ impl Client {
             market_tickers: opt_vec(&market_tickers),
             ..SubscribeParams::default()
         };
-        self.subscribe_typed(Channel::Ticker, params, |msg, tx: &mpsc::Sender<Ticker>| {
+        self.subscribe_typed(Channel::Ticker, params, |msg, tx: &mpsc::UnboundedSender<Ticker>| {
             if let ServerMessage::Ticker { msg, .. } = msg {
-                let _ = tx.try_send(msg.clone());
+                let _ = tx.send(msg.clone());
             }
         })
         .await
@@ -319,9 +319,9 @@ impl Client {
             market_tickers: opt_vec(&market_tickers),
             ..SubscribeParams::default()
         };
-        self.subscribe_typed(Channel::Trade, params, |msg, tx: &mpsc::Sender<Trade>| {
+        self.subscribe_typed(Channel::Trade, params, |msg, tx: &mpsc::UnboundedSender<Trade>| {
             if let ServerMessage::Trade { msg, .. } = msg {
-                let _ = tx.try_send(msg.clone());
+                let _ = tx.send(msg.clone());
             }
         })
         .await
@@ -338,15 +338,15 @@ impl Client {
         self.subscribe_typed(
             Channel::OrderbookDelta,
             params,
-            |msg, tx: &mpsc::Sender<OrderbookEvent>| match msg {
+            |msg, tx: &mpsc::UnboundedSender<OrderbookEvent>| match msg {
                 ServerMessage::OrderbookSnapshot { seq, msg, .. } => {
-                    let _ = tx.try_send(OrderbookEvent::Snapshot {
+                    let _ = tx.send(OrderbookEvent::Snapshot {
                         seq: *seq,
                         snapshot: msg.clone(),
                     });
                 }
                 ServerMessage::OrderbookDelta { seq, msg, .. } => {
-                    let _ = tx.try_send(OrderbookEvent::Delta {
+                    let _ = tx.send(OrderbookEvent::Delta {
                         seq: *seq,
                         delta: msg.clone(),
                     });
@@ -365,9 +365,9 @@ impl Client {
             market_tickers: market_tickers.filter(|v| !v.is_empty()),
             ..SubscribeParams::default()
         };
-        self.subscribe_typed(Channel::Fill, params, |msg, tx: &mpsc::Sender<Fill>| {
+        self.subscribe_typed(Channel::Fill, params, |msg, tx: &mpsc::UnboundedSender<Fill>| {
             if let ServerMessage::Fill { msg, .. } = msg {
-                let _ = tx.try_send(msg.clone());
+                let _ = tx.send(msg.clone());
             }
         })
         .await
@@ -384,9 +384,9 @@ impl Client {
         self.subscribe_typed(
             Channel::UserOrders,
             params,
-            |msg, tx: &mpsc::Sender<UserOrder>| {
+            |msg, tx: &mpsc::UnboundedSender<UserOrder>| {
                 if let ServerMessage::UserOrder { msg, .. } = msg {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             },
         )
@@ -404,9 +404,9 @@ impl Client {
         self.subscribe_typed(
             Channel::MarketPositions,
             params,
-            |msg, tx: &mpsc::Sender<MarketPosition>| {
+            |msg, tx: &mpsc::UnboundedSender<MarketPosition>| {
                 if let ServerMessage::MarketPosition { msg, .. } = msg {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             },
         )
@@ -418,12 +418,12 @@ impl Client {
         self.subscribe_typed(
             Channel::MarketLifecycleV2,
             params,
-            |msg, tx: &mpsc::Sender<LifecycleEvent>| match msg {
+            |msg, tx: &mpsc::UnboundedSender<LifecycleEvent>| match msg {
                 ServerMessage::MarketLifecycleV2 { msg, .. } => {
-                    let _ = tx.try_send(LifecycleEvent::Market(msg.clone()));
+                    let _ = tx.send(LifecycleEvent::Market(msg.clone()));
                 }
                 ServerMessage::EventLifecycle { msg, .. } => {
-                    let _ = tx.try_send(LifecycleEvent::Event(msg.clone()));
+                    let _ = tx.send(LifecycleEvent::Event(msg.clone()));
                 }
                 _ => {}
             },
@@ -436,12 +436,12 @@ impl Client {
         self.subscribe_typed(
             Channel::MultivariateMarketLifecycle,
             params,
-            |msg, tx: &mpsc::Sender<LifecycleEvent>| match msg {
+            |msg, tx: &mpsc::UnboundedSender<LifecycleEvent>| match msg {
                 ServerMessage::MultivariateMarketLifecycle { msg, .. } => {
-                    let _ = tx.try_send(LifecycleEvent::Market(msg.clone()));
+                    let _ = tx.send(LifecycleEvent::Market(msg.clone()));
                 }
                 ServerMessage::EventLifecycle { msg, .. } => {
-                    let _ = tx.try_send(LifecycleEvent::Event(msg.clone()));
+                    let _ = tx.send(LifecycleEvent::Event(msg.clone()));
                 }
                 _ => {}
             },
@@ -454,9 +454,9 @@ impl Client {
         self.subscribe_typed(
             Channel::Multivariate,
             params,
-            |msg, tx: &mpsc::Sender<MultivariateLookup>| {
+            |msg, tx: &mpsc::UnboundedSender<MultivariateLookup>| {
                 if let ServerMessage::MultivariateLookup { msg, .. } = msg {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             },
         )
@@ -479,21 +479,21 @@ impl Client {
         self.subscribe_typed(
             Channel::Communications,
             params,
-            |msg, tx: &mpsc::Sender<CommunicationEvent>| match msg {
+            |msg, tx: &mpsc::UnboundedSender<CommunicationEvent>| match msg {
                 ServerMessage::RfqCreated { msg, .. } => {
-                    let _ = tx.try_send(CommunicationEvent::RfqCreated(msg.clone()));
+                    let _ = tx.send(CommunicationEvent::RfqCreated(msg.clone()));
                 }
                 ServerMessage::RfqDeleted { msg, .. } => {
-                    let _ = tx.try_send(CommunicationEvent::RfqDeleted(msg.clone()));
+                    let _ = tx.send(CommunicationEvent::RfqDeleted(msg.clone()));
                 }
                 ServerMessage::QuoteCreated { msg, .. } => {
-                    let _ = tx.try_send(CommunicationEvent::QuoteCreated(msg.clone()));
+                    let _ = tx.send(CommunicationEvent::QuoteCreated(msg.clone()));
                 }
                 ServerMessage::QuoteAccepted { msg, .. } => {
-                    let _ = tx.try_send(CommunicationEvent::QuoteAccepted(msg.clone()));
+                    let _ = tx.send(CommunicationEvent::QuoteAccepted(msg.clone()));
                 }
                 ServerMessage::QuoteExecuted { msg, .. } => {
-                    let _ = tx.try_send(CommunicationEvent::QuoteExecuted(msg.clone()));
+                    let _ = tx.send(CommunicationEvent::QuoteExecuted(msg.clone()));
                 }
                 _ => {}
             },
@@ -506,9 +506,9 @@ impl Client {
         self.subscribe_typed(
             Channel::OrderGroupUpdates,
             params,
-            |msg, tx: &mpsc::Sender<OrderGroupUpdate>| {
+            |msg, tx: &mpsc::UnboundedSender<OrderGroupUpdate>| {
                 if let ServerMessage::OrderGroupUpdates { msg, .. } = msg {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             },
         )
@@ -557,7 +557,7 @@ impl Client {
     ) -> Result<Subscription<T>>
     where
         T: Send + 'static,
-        F: Fn(&ServerMessage, &mpsc::Sender<T>) + Send + Sync + 'static,
+        F: Fn(&ServerMessage, &mpsc::UnboundedSender<T>) + Send + Sync + 'static,
     {
         // Auth precheck.
         if channel.requires_auth() && self.inner.config.credentials.is_none() {
@@ -567,8 +567,13 @@ impl Client {
         }
         params.channels = vec![channel];
 
-        let buffer = self.inner.config.default_subscription_buffer;
-        let (data_tx, data_rx) = mpsc::channel::<T>(buffer);
+        // Unbounded channel: the multiplexer's dispatcher must NEVER drop a
+        // wire frame, even briefly. With a bounded mpsc + try_send, a slow
+        // consumer would silently lose deltas and the local order book would
+        // diverge from the server's. The supervisor's connection-health
+        // checks catch a permanently stuck consumer before unbounded growth
+        // becomes a problem in practice.
+        let (data_tx, data_rx) = mpsc::unbounded_channel::<T>();
 
         // Dispatcher captures the typed sender; no trait object hierarchy needed.
         let dispatcher: Dispatcher = {
